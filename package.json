@@ -1,0 +1,76 @@
+{
+  "name": "aiconsole",
+  "version": "1.0.0",
+  "description": "Minimal tiled terminal app built on Electron + xterm.js",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "postinstall": "node scripts/fix-winpty.js && electron-rebuild",
+    "dist": "electron-builder --win && rmdir /s /q dist\\win-unpacked"
+  },
+  "dependencies": {
+    "node-pty": "^1.0.0",
+    "sherpa-onnx": "^1.12.33"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^3.6.0",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "com.aiconsole.app",
+    "productName": "AIConsole",
+    "icon": "favicon_dark.ico",
+    "npmRebuild": true,
+    "asarUnpack": [
+      "node_modules/node-pty/**",
+      "node_modules/sherpa-onnx/**",
+      "stt-worker.js",
+      "stt-model/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "stt.js",
+      "stt-worker.js",
+      "renderer/**",
+      "node_modules/**",
+      "!node_modules/node-pty/build/Release/obj",
+      "!node_modules/node-pty/build/Release/obj/**",
+      "!node_modules/node-pty/build/Release/*.iobj",
+      "!node_modules/node-pty/build/Release/*.ipdb",
+      "!node_modules/node-pty/build/Release/*.exp",
+      "!node_modules/node-pty/build/Release/*.lib",
+      "!node_modules/node-pty/src/**",
+      "!node_modules/node-pty/deps/**",
+      "!node_modules/node-pty/node-addon-api/**",
+      "!node_modules/node-pty/third_party/**",
+      "!node_modules/node-pty/scripts/**",
+      "layouts.conf",
+      "stt-model/**",
+      "favicon_dark.ico"
+    ]
+  }
+}
