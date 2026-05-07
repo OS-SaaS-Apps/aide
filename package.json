@@ -1,5 +1,5 @@
 {
-  "name": "aiconsole",
+  "name": "aide",
   "version": "1.0.0",
   "description": "Minimal tiled terminal app built on Electron + xterm.js",
   "main": "main.js",
@@ -20,8 +20,8 @@
     "electron-builder": "^25.0.0"
   },
   "build": {
-    "appId": "com.aiconsole.app",
-    "productName": "AIConsole",
+    "appId": "com.aide.app",
+    "productName": "AIDE",
     "icon": "favicon_dark.ico",
     "npmRebuild": true,
     "asarUnpack": [

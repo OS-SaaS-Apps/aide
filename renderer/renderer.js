@@ -22,6 +22,269 @@
   let panes;   // → active tab's panes Map (updated by switchTab)
   let grid;    // → active tab's gridEl   (updated by switchTab)
   let nextId = 1;
+  let userDataPath = '';           // resolved once at startup
+
+  // OS-aware path join (renderer has no access to node:path)
+  function pathJoin(base, ...parts) {
+    const sep = base.includes('\\') ? '\\' : '/';
+    return [base, ...parts].join(sep);
+  }
+
+  // ── Claude Code pane detection ────────────────────────
+  function isClaudeCodePane(pane) {
+    if (pane.type !== 'terminal') return false;
+    if (pane.isClaudePane) return true;
+    if (pane.claudeSessionId) return true;
+    if (pane.initCommand && /^\s*claude(?:\.exe)?\b/i.test(pane.initCommand)) return true;
+    return false;
+  }
+
+  // ── CLAUDE.md snippet templates ───────────────────────
+  const CLAUDE_MD_MEMORY = `## AIDE Memory Vault
+
+You have access to a memory vault via the \`aide-memory\` MCP server.
+
+- Call \`search_memory(query)\` before starting a task to retrieve relevant context.
+- Call \`write_memory(title, content, tags)\` when you learn something worth keeping across sessions.
+- Call \`list_memories(tag?)\` to see all stored notes.
+
+Proactively search before answering questions about this project. Write memories after significant decisions or discoveries.`;
+
+  const CLAUDE_MD_TASKS = `## AIDE Task Board
+
+You have access to a task board via the \`aide-tasks\` MCP server.
+
+- Call \`create_task(title, description, status)\` when starting a new work item.
+- Call \`update_task(id, status, notes)\` when completing or making progress on a task.
+- Call \`list_tasks(status?)\` to see the current state of the board.
+
+Keep the task board updated as work progresses. Create tasks for non-trivial work items.`;
+
+  // ── Association helpers ───────────────────────────────
+  async function writeAssocToCwd(cwd, type, resourcePath) {
+    const sep          = cwd.includes('\\') ? '\\' : '/';
+    const claudeDir    = cwd + sep + '.claude';
+    const settingsPath = claudeDir + sep + 'settings.json';
+    const mcpJsonPath  = cwd + sep + '.mcp.json';
+    const claudeMdPath = cwd + sep + 'CLAUDE.md';
+
+    // Ensure .claude dir exists
+    await window.electronAPI.createDir(cwd, '.claude');
+
+    // Write mcpServers to .mcp.json (Claude Code ignores mcpServers in settings.json)
+    let mcpConfig = { mcpServers: {} };
+    const mcpr = await window.electronAPI.readTextFile(mcpJsonPath);
+    if (mcpr.success) { try { mcpConfig = JSON.parse(mcpr.content); } catch {} }
+    mcpConfig.mcpServers = mcpConfig.mcpServers || {};
+    mcpConfig.mcpServers[`aide-${type}`] = {
+      command: 'node',
+      args: [pathJoin(userDataPath, 'mcp', `${type}-mcp.js`), resourcePath],
+    };
+    await window.electronAPI.writeTextFile(mcpJsonPath, JSON.stringify(mcpConfig, null, 2));
+
+    // Auto-inject hook for memory only (hooks stay in .claude/settings.json)
+    if (type === 'memory') {
+      let settings = {};
+      const sr = await window.electronAPI.readTextFile(settingsPath);
+      if (sr.success) { try { settings = JSON.parse(sr.content); } catch {} }
+      settings.hooks = settings.hooks || {};
+      settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit || [];
+      const hookCmd = `node "${pathJoin(userDataPath, 'mcp', 'memory-hook.js')}" "${resourcePath}"`;
+      const existing = settings.hooks.UserPromptSubmit;
+      const alreadyHooked = existing.some(h =>
+        h.hooks?.some(hh => hh.command?.includes('memory-hook.js'))
+      );
+      if (!alreadyHooked) {
+        existing.push({ matcher: '', hooks: [{ type: 'command', command: hookCmd }] });
+      }
+      await window.electronAPI.writeTextFile(settingsPath, JSON.stringify(settings, null, 2));
+    }
+
+    // Merge CLAUDE.md snippet
+    const snippet  = type === 'memory' ? CLAUDE_MD_MEMORY : CLAUDE_MD_TASKS;
+    const marker   = `<!-- aide:${type} -->`;
+    const endMarker = `<!-- /aide:${type} -->`;
+    let md = '';
+    const mr = await window.electronAPI.readTextFile(claudeMdPath);
+    if (mr.success) md = mr.content;
+    const re = new RegExp(`${marker}[\\s\\S]*?${endMarker}\\n?`, 'g');
+    md = md.replace(re, '').trimEnd();
+    md = (md ? md + '\n\n' : '') + marker + '\n' + snippet + '\n' + endMarker + '\n';
+    await window.electronAPI.writeTextFile(claudeMdPath, md);
+  }
+
+  async function removeAssocFromCwd(cwd, type) {
+    const sep          = cwd.includes('\\') ? '\\' : '/';
+    const settingsPath = cwd + sep + '.claude' + sep + 'settings.json';
+    const mcpJsonPath  = cwd + sep + '.mcp.json';
+    const claudeMdPath = cwd + sep + 'CLAUDE.md';
+
+    // Remove from .mcp.json
+    const mcpr = await window.electronAPI.readTextFile(mcpJsonPath);
+    if (mcpr.success) {
+      try {
+        const mcpConfig = JSON.parse(mcpr.content);
+        if (mcpConfig.mcpServers) {
+          delete mcpConfig.mcpServers[`aide-${type}`];
+          if (!Object.keys(mcpConfig.mcpServers).length) delete mcpConfig.mcpServers;
+        }
+        await window.electronAPI.writeTextFile(mcpJsonPath, JSON.stringify(mcpConfig, null, 2));
+      } catch {}
+    }
+
+    // Remove hook from .claude/settings.json (memory only)
+    if (type === 'memory') {
+      const sr = await window.electronAPI.readTextFile(settingsPath);
+      if (sr.success) {
+        try {
+          const settings = JSON.parse(sr.content);
+          if (settings.hooks?.UserPromptSubmit) {
+            settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit
+              .map(entry => ({
+                ...entry,
+                hooks: (entry.hooks || []).filter(h => !h.command?.includes('memory-hook.js')),
+              }))
+              .filter(entry => entry.hooks?.length);
+            if (!settings.hooks.UserPromptSubmit.length) delete settings.hooks.UserPromptSubmit;
+            if (!Object.keys(settings.hooks).length) delete settings.hooks;
+          }
+          await window.electronAPI.writeTextFile(settingsPath, JSON.stringify(settings, null, 2));
+        } catch {}
+      }
+    }
+
+    const mr = await window.electronAPI.readTextFile(claudeMdPath);
+    if (mr.success) {
+      const marker    = `<!-- aide:${type} -->`;
+      const endMarker = `<!-- /aide:${type} -->`;
+      const re = new RegExp(`${marker}[\\s\\S]*?${endMarker}\\n?`, 'g');
+      const updated = mr.content.replace(re, '').trimEnd();
+      await window.electronAPI.writeTextFile(claudeMdPath, updated ? updated + '\n' : '');
+    }
+  }
+
+  function addAssocIndicator(termPane, type) {
+    const el = termPane.element.querySelector('.assoc-indicator');
+    if (!el) return;
+    const types = new Set((el.dataset.types || '').split(',').filter(Boolean));
+    types.add(type);
+    el.dataset.types = [...types].join(',');
+    el.title = 'Associated: ' + [...types].join(', ');
+    el.classList.remove('hidden');
+  }
+
+  function removeAssocIndicator(termPane, type) {
+    const el = termPane.element.querySelector('.assoc-indicator');
+    if (!el) return;
+    const types = new Set((el.dataset.types || '').split(',').filter(Boolean));
+    types.delete(type);
+    el.dataset.types = [...types].join(',');
+    if (!types.size) {
+      el.dataset.types = '';
+      el.classList.add('hidden');
+    } else {
+      el.title = 'Associated: ' + [...types].join(', ');
+    }
+  }
+
+  function linkedTooltip(paneIds) {
+    const lines = paneIds.map(id => {
+      const p = globalPanes.get(id);
+      return p ? `• ${p.name}${p.cwd ? '  (' + p.cwd + ')' : ''}` : null;
+    }).filter(Boolean);
+    return lines.length
+      ? 'Linked to:\n' + lines.join('\n') + '\n\n⚠ Restart Claude Code to activate MCP tools\n\nClick to disassociate'
+      : 'Click to disassociate';
+  }
+
+  function setAssocBtnState(btn, active, paneIds) {
+    btn.textContent = active ? '🔗 Linked' : '🔗 Associate';
+    btn.style.color = active ? '#4ec9b0' : '';
+    btn.title = active
+      ? linkedTooltip(paneIds || [])
+      : 'Associate Claude Code panes in this tab';
+  }
+
+  function flashAssocError(btn, msg) {
+    const prevText  = btn.textContent;
+    const prevColor = btn.style.color;
+    btn.textContent = '⚠ ' + msg;
+    btn.style.color = '#f97316';
+    btn.title = msg;
+    setTimeout(() => {
+      btn.textContent = prevText;
+      btn.style.color = prevColor;
+      btn.title = 'Associate Claude Code panes in this tab';
+    }, 3000);
+  }
+
+  async function doAssociate(sourcePaneId, assocBtn) {
+    const sourcePane = panes.get(sourcePaneId);
+    if (!sourcePane) return;
+    const type = sourcePane.type; // 'memory' or 'tasks'
+
+    // ── Disassociate ──
+    if (sourcePane.associatedCwds.length) {
+      for (const cwd of sourcePane.associatedCwds) await removeAssocFromCwd(cwd, type);
+      for (const pid of sourcePane.associatedPaneIds) {
+        const p = globalPanes.get(pid);
+        if (p) removeAssocIndicator(p, type);
+      }
+      sourcePane.associatedCwds    = [];
+      sourcePane.associatedPaneIds = [];
+      setAssocBtnState(assocBtn, false);
+      return;
+    }
+
+    // ── Associate ──
+    const resourcePath = type === 'memory' ? sourcePane.vaultPath : sourcePane.tasksPath;
+    if (!resourcePath) {
+      flashAssocError(assocBtn, `Select a ${type === 'memory' ? 'vault' : 'tasks'} folder first`);
+      return;
+    }
+
+    const tab = tabs.get(activeTabId);
+    const claudePanes = [...(tab?.panes.values() || [])].filter(isClaudeCodePane);
+    if (!claudePanes.length) {
+      flashAssocError(assocBtn, 'No Claude Code panes detected');
+      return;
+    }
+
+    const cwdMap = new Map();
+    for (const p of claudePanes) {
+      if (!p.cwd) continue;
+      if (!cwdMap.has(p.cwd)) cwdMap.set(p.cwd, []);
+      cwdMap.get(p.cwd).push(p);
+    }
+
+    if (!cwdMap.size) {
+      flashAssocError(assocBtn, 'Claude panes have no working directory');
+      return;
+    }
+
+    for (const [cwd, cwdPanes] of cwdMap) {
+      await writeAssocToCwd(cwd, type, resourcePath);
+      sourcePane.associatedCwds.push(cwd);
+      for (const p of cwdPanes) {
+        if (!sourcePane.associatedPaneIds.includes(p.id)) sourcePane.associatedPaneIds.push(p.id);
+        addAssocIndicator(p, type);
+      }
+    }
+    setAssocBtnState(assocBtn, true, sourcePane.associatedPaneIds);
+  }
+
+  // Check a newly created terminal pane against existing memory/tasks panes
+  function autoReassociate(termPane) {
+    if (!termPane.cwd) return;
+    const tab = tabs.get(activeTabId);
+    if (!tab) return;
+    for (const p of tab.panes.values()) {
+      if (p.type !== 'memory' && p.type !== 'tasks') continue;
+      if (!p.associatedCwds.includes(termPane.cwd)) continue;
+      if (!p.associatedPaneIds.includes(termPane.id)) p.associatedPaneIds.push(termPane.id);
+      addAssocIndicator(termPane, p.type);
+    }
+  }
 
   // ── Built-in fallback layouts (used when no config file is found) ─────────
   // Defined as ASCII art — same format as layouts.conf — so one parser handles both.
@@ -921,6 +1184,18 @@
       initCmdInput = makeInput(pane.initCommand || '', 'e.g. npm run dev');
       makeField('Init Command', '(applies on restart)', initCmdInput);
 
+      const claudeRow = document.createElement('div');
+      claudeRow.className = 'dialog-field';
+      const claudeLabel = document.createElement('label');
+      claudeLabel.className = 'dialog-label';
+      claudeLabel.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;';
+      const claudeCheck = document.createElement('input');
+      claudeCheck.type    = 'checkbox';
+      claudeCheck.checked = !!pane.isClaudePane;
+      claudeLabel.append(claudeCheck, 'Claude Code pane');
+      claudeRow.appendChild(claudeLabel);
+      box.appendChild(claudeRow);
+
     } else if (pane.type === 'browser') {
       urlInput = makeInput(pane.urlInput?.value || '', 'https://');
       makeField('URL', '', urlInput);
@@ -986,6 +1261,7 @@
         pane.shell       = shellInput.value.trim() || null;
         pane.cwd         = cwdInput.value.trim() || null;
         pane.initCommand = initCmdInput.value.trim() || null;
+        pane.isClaudePane = claudeCheck.checked;
       } else if (pane.type === 'browser') {
         let url = urlInput.value.trim();
         if (url) {
@@ -1191,12 +1467,36 @@
     grid._updateResizeHandles?.();
 
     for (const pd of session.panes) {
-      // For text panes, filePath is passed via cwd slot
-      const initCwd = pd.type === 'text' ? (pd.filePath || null) : (pd.cwd || null);
+      // cwd slot carries filePath (text), vaultPath (memory); url slot carries tasksPath (tasks)
+      const initCwd = pd.type === 'text'   ? (pd.filePath  || null)
+                    : pd.type === 'memory' ? (pd.vaultPath || null)
+                    : (pd.cwd || null);
+      const initUrl = pd.type === 'browser' ? (pd.url      || null)
+                    : pd.type === 'tasks'   ? (pd.tasksPath || null)
+                    : null;
       const initCmd = pd.type === 'terminal'
         ? withClaudeResume(pd.initCommand || null, pd.claudeSessionId || null)
+        : pd.type === 'memory' ? (pd.openFilePath || null)
         : (pd.initCommand || null);
-      createPane(pd.type, pd.gridArea || null, pd.shell || null, initCwd, initCmd, pd.name || null, pd.type === 'browser' ? (pd.url || null) : null, pd.predefinedCommands || null);
+      createPane(pd.type, pd.gridArea || null, pd.shell || null, initCwd, initCmd, pd.name || null, initUrl, pd.predefinedCommands || null);
+    }
+
+    // Restore associatedCwds on memory/tasks panes, then rebuild associatedPaneIds
+    for (const pd of session.panes) {
+      if ((pd.type !== 'memory' && pd.type !== 'tasks') || !pd.associatedCwds?.length) continue;
+      const restoredPane = [...panes.values()].findLast(p => p.type === pd.type);
+      if (!restoredPane) continue;
+      restoredPane.associatedCwds = pd.associatedCwds;
+      for (const p of panes.values()) {
+        if (!isClaudeCodePane(p)) continue;
+        if (pd.associatedCwds.includes(p.cwd)) {
+          if (!restoredPane.associatedPaneIds.includes(p.id)) restoredPane.associatedPaneIds.push(p.id);
+          addAssocIndicator(p, pd.type);
+        }
+      }
+      if (restoredPane.associatedCwds.length && restoredPane.assocBtn) {
+        setAssocBtnState(restoredPane.assocBtn, true, restoredPane.associatedPaneIds);
+      }
     }
 
     updateAddButton();
@@ -1248,6 +1548,14 @@
     document.getElementById('btn-add-text').addEventListener('click', () => {
       addMenu.classList.add('hidden');
       addPane('text');
+    });
+    document.getElementById('btn-add-memory').addEventListener('click', () => {
+      addMenu.classList.add('hidden');
+      addPane('memory');
+    });
+    document.getElementById('btn-add-tasks').addEventListener('click', () => {
+      addMenu.classList.add('hidden');
+      addPane('tasks');
     });
   }
 
@@ -1336,6 +1644,10 @@
     } catch (e) {
       console.error('[addPane] initNewTerminals threw:', e);
     }
+    if (type === 'terminal') {
+      const newPane = [...panes.values()].findLast(p => p.type === 'terminal');
+      if (newPane) autoReassociate(newPane);
+    }
   }
 
   function getPaneConfig(pane) {
@@ -1345,6 +1657,10 @@
       return { type: 'terminal',  name: pane.name, shell: pane.shell || null, cwd: pane.cwd || null, initCommand: pane.initCommand || null };
     if (pane.type === 'explorer')
       return { type: 'explorer',  name: pane.name, cwd: pane.cwd || null };
+    if (pane.type === 'memory')
+      return { type: 'memory',    name: pane.name, vaultPath: pane.vaultPath || null };
+    if (pane.type === 'tasks')
+      return { type: 'tasks',     name: pane.name, tasksPath: pane.tasksPath || null };
     return   { type: 'text',      name: pane.name, filePath: pane.filePath || null };
   }
 
@@ -1360,7 +1676,7 @@
     const header = document.createElement('div');
     header.className = 'pane-header';
 
-    const defaultName = savedName || (type === 'terminal' ? `Terminal ${id}` : type === 'explorer' ? `Explorer ${id}` : `Browser ${id}`);
+    const defaultName = savedName || (type === 'terminal' ? `Terminal ${id}` : type === 'explorer' ? `Explorer ${id}` : type === 'memory' ? `Memory ${id}` : type === 'tasks' ? `Tasks ${id}` : `Browser ${id}`);
 
     const title = document.createElement('span');
     title.className   = 'pane-title';
@@ -1985,6 +2301,21 @@
           .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
           .replace(/\*(.+?)\*/g,'<em>$1</em>')
           .replace(/`([^`]+)`/g,'<code>$1</code>')
+          .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, src) => {
+            let url = src;
+            if (!/^(https?:|file:|data:|blob:)/.test(src)) {
+              const abs = /^[A-Za-z]:[\\\/]|^\//.test(src) ? src : (() => {
+                if (!filePath) return src;
+                const sep = filePath.includes('\\') ? '\\' : '/';
+                const dir = filePath.substring(0, filePath.lastIndexOf(sep));
+                return dir + sep + src.replace(/[\/\\]/g, sep);
+              })();
+              url = 'file:///' + abs.replace(/\\/g, '/');
+            }
+            return `<img src="${url}" alt="${alt.replace(/"/g,'&quot;')}" style="max-width:100%;height:auto">`;
+          })
+          .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g,'<a class="wikilink" data-target="$1">$2</a>')
+          .replace(/\[\[([^\]]+)\]\]/g,'<a class="wikilink" data-target="$1">$1</a>')
           .replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2">$1</a>')
           .replace(/^- (.+)$/gm,'<li>$1</li>')
           .replace(/^> (.+)$/gm,'<blockquote>$1</blockquote>')
@@ -1992,6 +2323,21 @@
           .replace(/\n/g,'<br/>');
         return '<p>' + html + '</p>';
       }
+
+      viewPane.addEventListener('click', (e) => {
+        const link = e.target.closest('a.wikilink');
+        if (!link) return;
+        e.preventDefault();
+        const target = link.dataset.target;
+        if (!target || !filePath) return;
+        const sep = filePath.includes('\\') ? '\\' : '/';
+        const dir = filePath.substring(0, filePath.lastIndexOf(sep));
+        const resolved = target.includes('.') ? target : target + '.md';
+        const fullPath = resolved.startsWith('/') || /^[A-Za-z]:[\\\/]/.test(resolved)
+          ? resolved
+          : dir + sep + resolved.replace(/\//g, sep).replace(/\\/g, sep);
+        loadFile(fullPath);
+      });
 
       function showEditorError(msg) {
         const orig = title.textContent;
@@ -2064,6 +2410,563 @@
       panes.set(id, pane);
       globalPanes.set(id, pane);
 
+    } else if (type === 'memory') {
+      // ── Memory pane ───────────────────────────────────────
+      const nav = document.createElement('div');
+      nav.className = 'browser-nav';
+
+      const folderBtn      = makeNavBtn('📁', 'Select vault folder');
+      const newNoteBtn     = makeNavBtn('＋', 'New note in current folder');
+      const newFolderBtn   = makeNavBtn('📁＋', 'New subfolder in current folder');
+      const refreshBtn     = makeNavBtn('↺', 'Refresh file tree');
+      const assocBtn       = makeNavBtn('🔗 Associate', 'Associate Claude Code panes in this tab');
+
+      const pathLabel = document.createElement('span');
+      pathLabel.className   = 'memory-path-label';
+      pathLabel.title       = cwd || '';
+      pathLabel.textContent = cwd ? cwd.split(/[\\/]/).pop() : 'No vault selected';
+
+      nav.append(folderBtn, pathLabel, newNoteBtn, newFolderBtn, refreshBtn, assocBtn);
+      header.append(title, nav, detachBtn, settingsBtn, closeBtn);
+
+      const body = document.createElement('div');
+      body.className = 'memory-body';
+
+      // ── Left: file tree ──
+      const treeEl = document.createElement('div');
+      treeEl.className = 'memory-tree';
+
+      // ── Right: editor ──
+      const editorWrap = document.createElement('div');
+      editorWrap.className = 'memory-editor';
+
+      const editorToolbar = document.createElement('div');
+      editorToolbar.className = 'memory-editor-toolbar';
+
+      const filePathLabel = document.createElement('span');
+      filePathLabel.className   = 'memory-file-path';
+      filePathLabel.textContent = 'No file open';
+
+      const saveBtn = document.createElement('button');
+      saveBtn.className   = 'nav-btn';
+      saveBtn.title       = 'Save (Ctrl+S)';
+      saveBtn.innerHTML   = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>';
+
+      const editBtn = document.createElement('button');
+      editBtn.className = 'nav-btn';
+      editBtn.title = 'Edit file';
+      editBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/></svg>';
+
+      editorToolbar.append(filePathLabel, saveBtn, editBtn);
+
+      const mdTextarea = document.createElement('textarea');
+      mdTextarea.className      = 'memory-textarea';
+      mdTextarea.spellcheck     = false;
+      mdTextarea.wrap           = 'off';
+      mdTextarea.placeholder    = 'Select a file from the tree…';
+
+      const previewEl = document.createElement('div');
+      previewEl.className = 'memory-preview hidden';
+
+      editorWrap.append(editorToolbar, mdTextarea, previewEl);
+      body.append(treeEl, editorWrap);
+      paneEl.append(header, body);
+      grid.appendChild(paneEl);
+
+      let vaultPath    = cwd || null;
+      let currentFile  = null;
+      let currentDir   = vaultPath;
+      let memDirty     = false;
+      let isReadMode   = false;
+      const expanded   = new Set();
+
+      function resolveMemImgSrc(src) {
+        if (/^(https?:|file:|data:|blob:)/.test(src)) return src;
+        if (/^[A-Za-z]:[\\\/]|^\//.test(src)) return 'file:///' + src.replace(/\\/g, '/');
+        if (!currentFile) return src;
+        const sep = currentFile.includes('\\') ? '\\' : '/';
+        const dir = currentFile.substring(0, currentFile.lastIndexOf(sep));
+        const abs = dir + sep + src.replace(/[\/\\]/g, sep);
+        return 'file:///' + abs.replace(/\\/g, '/');
+      }
+
+      function memRenderMarkdown(md) {
+        let html = md
+          .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+          .replace(/^#{6}\s+(.+)$/gm,'<h6>$1</h6>').replace(/^#{5}\s+(.+)$/gm,'<h5>$1</h5>')
+          .replace(/^#{4}\s+(.+)$/gm,'<h4>$1</h4>').replace(/^###\s+(.+)$/gm,'<h3>$1</h3>')
+          .replace(/^##\s+(.+)$/gm,'<h2>$1</h2>').replace(/^#\s+(.+)$/gm,'<h1>$1</h1>')
+          .replace(/^---+$/gm,'<hr/>')
+          .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>').replace(/\*(.+?)\*/g,'<em>$1</em>')
+          .replace(/`([^`]+)`/g,'<code>$1</code>')
+          .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_, alt, src) => `<img src="${resolveMemImgSrc(src)}" alt="${alt.replace(/"/g,'&quot;')}" style="max-width:100%;height:auto">`)
+          .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g,'<a class="wikilink" data-target="$1">$2</a>')
+          .replace(/\[\[([^\]]+)\]\]/g,'<a class="wikilink" data-target="$1">$1</a>')
+          .replace(/\[([^\]]+)\]\(([^)]+)\)/g,'<a href="$2">$1</a>')
+          .replace(/^- (.+)$/gm,'<li>$1</li>').replace(/^> (.+)$/gm,'<blockquote>$1</blockquote>')
+          .replace(/\n{2,}/g,'</p><p>').replace(/\n/g,'<br/>');
+        return '<p>' + html + '</p>';
+      }
+
+      function setMemDirty(val) {
+        memDirty = val;
+        saveBtn.style.color = val ? '#f4d03f' : '';
+        const base = currentFile ? currentFile.split(/[\\/]/).pop() : '';
+        title.textContent = defaultName + (base ? ` — ${base}` : '') + (val ? ' •' : '');
+      }
+
+      async function openMemFile(filePath) {
+        if (memDirty) { await saveMemFile(); }
+        currentFile = filePath;
+        currentDir  = filePath.replace(/[\\/][^\\/]+$/, '') || vaultPath;
+        filePathLabel.textContent = filePath.split(/[\\/]/).pop();
+        filePathLabel.title = filePath;
+
+        if (/\.(jpg|jpeg|png|gif|webp|svg|bmp)$/i.test(filePath)) {
+          mdTextarea.value = '';
+          setMemDirty(false);
+          editorWrap.classList.remove('split-mode');
+          mdTextarea.classList.add('hidden');
+          previewEl.classList.remove('hidden');
+          previewEl.innerHTML = `<div style="padding:12px;text-align:center"><img src="${resolveMemImgSrc(filePath)}" alt="${filePath.split(/[\\/]/).pop().replace(/"/g,'&quot;')}" style="max-width:100%;height:auto;display:block;margin:auto"></div>`;
+          isReadMode = true;
+          editBtn.style.color = '';
+          return;
+        }
+
+        const result = await window.electronAPI.readTextFile(filePath);
+        if (!result.success) return;
+        mdTextarea.value = result.content;
+        setMemDirty(false);
+        setReadMode(true);
+      }
+
+      async function saveMemFile() {
+        if (!currentFile) return;
+        await window.electronAPI.writeTextFile(currentFile, mdTextarea.value);
+        setMemDirty(false);
+      }
+
+      function setReadMode(readMode) {
+        isReadMode = readMode;
+        editBtn.style.color = readMode ? '' : '#4ec9b0';
+        if (readMode) {
+          editorWrap.classList.remove('split-mode');
+          previewEl.innerHTML = currentFile ? memRenderMarkdown(mdTextarea.value) : '';
+          previewEl.classList.remove('hidden');
+          mdTextarea.classList.add('hidden');
+        } else {
+          editorWrap.classList.add('split-mode');
+          previewEl.innerHTML = currentFile ? memRenderMarkdown(mdTextarea.value) : '';
+          previewEl.classList.remove('hidden');
+          mdTextarea.classList.remove('hidden');
+        }
+      }
+
+      async function renderMemTree(container, dirPath, depth) {
+        const entries = await window.electronAPI.readDir(dirPath);
+        const dirs  = entries.filter(e => e.isDirectory).sort((a,b)=>a.name.localeCompare(b.name));
+        const files = entries.filter(e => !e.isDirectory && /\.(md|txt|jpg|jpeg|png|gif|webp|svg|bmp)$/i.test(e.name)).sort((a,b)=>a.name.localeCompare(b.name));
+        for (const entry of [...dirs, ...files]) {
+          const item = document.createElement('div');
+          item.className = 'memory-tree-item' + (entry.isDirectory ? ' is-dir' : '');
+          item.style.paddingLeft = (depth * 14 + 8) + 'px';
+
+          const icon = document.createElement('span');
+          icon.className   = 'memory-tree-icon';
+          icon.textContent = entry.isDirectory ? (expanded.has(entry.path) ? '📂' : '📁') : (/\.(jpg|jpeg|png|gif|webp|svg|bmp)$/i.test(entry.name) ? '🖼' : entry.name.endsWith('.md') ? '📝' : '📄');
+
+          const name = document.createElement('span');
+          name.textContent = entry.isDirectory ? entry.name : entry.name.replace(/\.[^.]+$/, '');
+
+          item.append(icon, name);
+          container.appendChild(item);
+
+          if (entry.isDirectory) {
+            if (currentDir === entry.path) item.classList.add('active-dir');
+            item.addEventListener('click', async (e) => {
+              e.stopPropagation();
+              currentDir = entry.path;
+              if (expanded.has(entry.path)) {
+                expanded.delete(entry.path);
+              } else {
+                expanded.add(entry.path);
+              }
+              await refreshMemTree();
+            });
+            item.addEventListener('dblclick', (e) => { e.stopPropagation(); window.electronAPI.openFile(entry.path); });
+            if (expanded.has(entry.path)) {
+              await renderMemTree(container, entry.path, depth + 1);
+            }
+          } else {
+            item.addEventListener('click', () => openMemFile(entry.path));
+            item.addEventListener('dblclick', () => {
+              if (/\.(jpg|jpeg|png|gif|webp|svg|bmp)$/i.test(entry.name)) window.electronAPI.openFile(entry.path);
+              else if (/\.md$/i.test(entry.name)) window.electronAPI.openNotepad(entry.path);
+              else window.electronAPI.openFile(entry.path);
+            });
+            if (currentFile === entry.path) item.classList.add('active');
+          }
+        }
+      }
+
+      async function refreshMemTree() {
+        treeEl.innerHTML = '';
+        if (!vaultPath) {
+          const empty = document.createElement('div');
+          empty.className   = 'memory-tree-empty';
+          empty.textContent = 'No vault selected';
+          treeEl.appendChild(empty);
+          return;
+        }
+        await renderMemTree(treeEl, vaultPath, 0);
+      }
+
+      folderBtn.addEventListener('click', async () => {
+        const dir = await window.electronAPI.openDirectoryPicker();
+        if (!dir) return;
+        vaultPath  = dir;
+        currentDir = dir;
+        pathLabel.textContent = dir.split(/[\\/]/).pop();
+        pathLabel.title = dir;
+        expanded.clear();
+        await refreshMemTree();
+      });
+
+      refreshBtn.addEventListener('click', () => refreshMemTree());
+
+      newNoteBtn.addEventListener('click', async () => {
+        if (!vaultPath) return;
+        const name = prompt('New note name (without extension):');
+        if (!name) return;
+        const dir      = currentDir || vaultPath;
+        const filePath = dir + '\\' + name.replace(/[\\/:*?"<>|]/g,'_') + '.md';
+        await window.electronAPI.writeTextFile(filePath, '');
+        expanded.add(dir);
+        await refreshMemTree();
+        await openMemFile(filePath);
+        setReadMode(false);
+      });
+
+      newFolderBtn.addEventListener('click', async () => {
+        if (!vaultPath) return;
+        const name = prompt('New folder name:');
+        if (!name) return;
+        const dir    = currentDir || vaultPath;
+        const newDir = dir + '\\' + name.replace(/[\\/:*?"<>|]/g,'_');
+        await window.electronAPI.ensureDir(newDir);
+        currentDir = newDir;
+        expanded.add(dir);
+        expanded.add(newDir);
+        await refreshMemTree();
+      });
+
+      mdTextarea.addEventListener('input', () => {
+        setMemDirty(true);
+        if (!isReadMode) previewEl.innerHTML = memRenderMarkdown(mdTextarea.value);
+      });
+      mdTextarea.addEventListener('keydown', e => {
+        if (e.ctrlKey && e.key === 's') { e.preventDefault(); saveMemFile(); }
+      });
+
+      saveBtn.addEventListener('click', () => saveMemFile());
+
+      editBtn.addEventListener('click', () => setReadMode(!isReadMode));
+
+      previewEl.addEventListener('click', (e) => {
+        const link = e.target.closest('a.wikilink');
+        if (!link) return;
+        e.preventDefault();
+        const target = link.dataset.target;
+        if (!target || !currentFile) return;
+        const sep = currentFile.includes('\\') ? '\\' : '/';
+        const dir = currentFile.substring(0, currentFile.lastIndexOf(sep));
+        const hasExt = /\.[^./\\]+$/.test(target);
+        const resolved = hasExt ? target : target + '.md';
+        const fullPath = /^[A-Za-z]:[\\\/]|^\//.test(resolved) ? resolved : dir + sep + resolved.replace(/[\/\\]/g, sep);
+        openMemFile(fullPath);
+      });
+
+      refreshMemTree().then(() => {
+        if (initCommand) openMemFile(initCommand);
+      });
+
+      const memData = {
+        id, type: 'memory', element: paneEl, name: defaultName,
+        get vaultPath()    { return vaultPath; },
+        get openFilePath() { return currentFile; },
+        associatedCwds:    [],
+        associatedPaneIds: [],
+        assocBtn,
+        resizeObserver: null,
+      };
+      panes.set(id, memData);
+      globalPanes.set(id, memData);
+
+      assocBtn.addEventListener('click', () => doAssociate(id, assocBtn));
+
+    } else if (type === 'tasks') {
+      // ── Tasks pane ────────────────────────────────────────
+      const nav = document.createElement('div');
+      nav.className = 'browser-nav';
+
+      const folderBtn   = makeNavBtn('📁', 'Select tasks folder');
+      const refreshBtn  = makeNavBtn('↺', 'Refresh tasks');
+      const showAllBtn  = makeNavBtn('⋯', 'Show archived & deleted');
+      const assocBtn    = makeNavBtn('🔗 Associate', 'Associate Claude Code panes in this tab');
+
+      const pathLabel = document.createElement('span');
+      pathLabel.className   = 'memory-path-label';
+      pathLabel.title       = url || '';
+      pathLabel.textContent = url ? url.split(/[\\/]/).pop() : 'No folder selected';
+
+      nav.append(folderBtn, pathLabel, refreshBtn, showAllBtn, assocBtn);
+      header.append(title, nav, detachBtn, settingsBtn, closeBtn);
+
+      const board = document.createElement('div');
+      board.className = 'tasks-board';
+      paneEl.append(header, board);
+      grid.appendChild(paneEl);
+
+      let tasksPath   = url || null;
+      let tasks       = [];
+      let showHidden  = false;
+      let dragTaskId  = null;
+
+      const COLUMNS = [
+        { key: 'todo',     label: 'ToDo',     addable: true  },
+        { key: 'doing',    label: 'Doing',    addable: false },
+        { key: 'done',     label: 'Done',     addable: false },
+        { key: 'archived', label: 'Archived', addable: false, hidden: true },
+        { key: 'deleted',  label: 'Deleted',  addable: false, hidden: true },
+      ];
+
+      function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
+
+      async function saveTasks() {
+        if (!tasksPath) return;
+        await window.electronAPI.writeTextFile(tasksPath + '\\tasks.json', JSON.stringify(tasks, null, 2));
+      }
+
+      async function loadTasks() {
+        if (!tasksPath) return;
+        const result = await window.electronAPI.readTextFile(tasksPath + '\\tasks.json');
+        tasks = result.success ? JSON.parse(result.content) : [];
+        renderBoard();
+      }
+
+      function showTaskDetails(task) {
+        const overlay = document.createElement('div');
+        overlay.className = 'dialog-overlay';
+        document.body.appendChild(overlay);
+
+        const box = document.createElement('div');
+        box.className = 'dialog-box';
+        overlay.appendChild(box);
+
+        const dlgTitle = document.createElement('div');
+        dlgTitle.className = 'dialog-title';
+        dlgTitle.textContent = task.title;
+        box.appendChild(dlgTitle);
+
+        const ta = document.createElement('textarea');
+        ta.className = 'task-details-textarea';
+        ta.value = task.description || '';
+        ta.placeholder = 'No description.';
+        box.appendChild(ta);
+
+        const actions = document.createElement('div');
+        actions.className = 'dialog-actions';
+
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'toolbar-btn';
+        saveBtn.textContent = 'Save';
+        saveBtn.addEventListener('click', async () => {
+          task.description = ta.value.trim();
+          await saveTasks();
+          overlay.remove();
+          renderBoard();
+        });
+
+        const cancelBtn = document.createElement('button');
+        cancelBtn.className = 'toolbar-btn dialog-cancel-btn';
+        cancelBtn.textContent = 'Cancel';
+        cancelBtn.addEventListener('click', () => overlay.remove());
+
+        actions.append(saveBtn, cancelBtn);
+        box.appendChild(actions);
+
+        overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+        overlay.addEventListener('keydown', e => { if (e.key === 'Escape') overlay.remove(); });
+        ta.focus();
+      }
+
+      function renderBoard() {
+        board.innerHTML = '';
+        for (const col of COLUMNS) {
+          if (col.hidden && !showHidden) continue;
+          const colEl = document.createElement('div');
+          colEl.className = 'tasks-col';
+          colEl.dataset.status = col.key;
+
+          const colHeader = document.createElement('div');
+          colHeader.className = 'tasks-col-header';
+          const colTitle = document.createElement('span');
+          colTitle.textContent = col.label;
+          const colCount = document.createElement('span');
+          colCount.className = 'tasks-col-count';
+          colCount.textContent = tasks.filter(t => t.status === col.key).length;
+          colHeader.append(colTitle, colCount);
+
+          const cardList = document.createElement('div');
+          cardList.className = 'tasks-card-list';
+
+          for (const task of tasks.filter(t => t.status === col.key)) {
+            const card = document.createElement('div');
+            card.className = 'task-card';
+            card.draggable = true;
+            card.dataset.taskId = task.id;
+
+            const cardTitle = document.createElement('div');
+            cardTitle.className = 'task-card-title';
+            cardTitle.textContent = task.title;
+            cardTitle.title = 'Double-click to edit';
+            cardTitle.addEventListener('dblclick', () => {
+              const inp = document.createElement('input');
+              inp.value = task.title;
+              inp.className = 'task-card-input';
+              cardTitle.replaceWith(inp);
+              inp.focus(); inp.select();
+              const commit = async () => {
+                const val = inp.value.trim();
+                if (val) { task.title = val; await saveTasks(); }
+                renderBoard();
+              };
+              inp.addEventListener('blur', commit);
+              inp.addEventListener('keydown', e => {
+                if (e.key === 'Enter')  { e.stopPropagation(); inp.blur(); }
+                if (e.key === 'Escape') { e.stopPropagation(); renderBoard(); }
+              });
+            });
+
+            const cardActions = document.createElement('div');
+            cardActions.className = 'task-card-actions';
+
+            // Move to adjacent column buttons
+            const colKeys = COLUMNS.map(c => c.key);
+            const idx = colKeys.indexOf(col.key);
+            if (idx > 0) {
+              const prevBtn = document.createElement('button');
+              prevBtn.textContent = '←';
+              prevBtn.title = 'Move to ' + COLUMNS[idx - 1].label;
+              prevBtn.addEventListener('click', async () => {
+                task.status = COLUMNS[idx - 1].key;
+                await saveTasks(); renderBoard();
+              });
+              cardActions.appendChild(prevBtn);
+            }
+            if (idx < COLUMNS.length - 1) {
+              const nextBtn = document.createElement('button');
+              nextBtn.textContent = '→';
+              nextBtn.title = 'Move to ' + COLUMNS[idx + 1].label;
+              nextBtn.addEventListener('click', async () => {
+                task.status = COLUMNS[idx + 1].key;
+                await saveTasks(); renderBoard();
+              });
+              cardActions.appendChild(nextBtn);
+            }
+
+            if (task.description) {
+              const detailsLink = document.createElement('span');
+              detailsLink.className = 'task-card-details-link';
+              detailsLink.textContent = 'details';
+              detailsLink.addEventListener('click', e => { e.stopPropagation(); showTaskDetails(task); });
+              cardActions.appendChild(detailsLink);
+            }
+
+            card.append(cardTitle, cardActions);
+
+            // Drag and drop
+            card.addEventListener('dragstart', e => {
+              dragTaskId = task.id;
+              e.dataTransfer.effectAllowed = 'move';
+              card.classList.add('task-dragging');
+            });
+            card.addEventListener('dragend', () => {
+              dragTaskId = null;
+              card.classList.remove('task-dragging');
+            });
+
+            cardList.appendChild(card);
+          }
+
+          // Drop zone
+          cardList.addEventListener('dragover', e => { e.preventDefault(); colEl.classList.add('tasks-col-over'); });
+          cardList.addEventListener('dragleave', e => { if (!colEl.contains(e.relatedTarget)) colEl.classList.remove('tasks-col-over'); });
+          cardList.addEventListener('drop', async e => {
+            e.preventDefault();
+            colEl.classList.remove('tasks-col-over');
+            if (!dragTaskId) return;
+            const task = tasks.find(t => t.id === dragTaskId);
+            if (task) { task.status = col.key; await saveTasks(); renderBoard(); }
+          });
+
+          colEl.append(colHeader, cardList);
+
+          if (col.addable) {
+            const addInput = document.createElement('input');
+            addInput.className   = 'task-add-input';
+            addInput.placeholder = '+ Add a task…';
+            addInput.spellcheck  = false;
+            addInput.addEventListener('keydown', async e => {
+              if (e.key !== 'Enter') return;
+              const val = addInput.value.trim();
+              if (!val) return;
+              tasks.push({ id: genId(), title: val, description: '', status: 'todo', createdAt: Date.now() });
+              addInput.value = '';
+              await saveTasks();
+              renderBoard();
+            });
+            colEl.appendChild(addInput);
+          }
+
+          board.appendChild(colEl);
+        }
+      }
+
+      folderBtn.addEventListener('click', async () => {
+        const dir = await window.electronAPI.openDirectoryPicker();
+        if (!dir) return;
+        tasksPath = dir;
+        pathLabel.textContent = dir.split(/[\\/]/).pop();
+        pathLabel.title = dir;
+        await loadTasks();
+      });
+
+      refreshBtn.addEventListener('click', () => loadTasks());
+
+      showAllBtn.addEventListener('click', () => {
+        showHidden = !showHidden;
+        showAllBtn.style.color = showHidden ? '#4ec9b0' : '';
+        renderBoard();
+      });
+
+      if (tasksPath) loadTasks();
+      else renderBoard();
+
+      const tasksData = {
+        id, type: 'tasks', element: paneEl, name: defaultName,
+        get tasksPath() { return tasksPath; },
+        associatedCwds:    [],
+        associatedPaneIds: [],
+        assocBtn,
+        resizeObserver: null,
+      };
+      panes.set(id, tasksData);
+      globalPanes.set(id, tasksData);
+
+      assocBtn.addEventListener('click', () => doAssociate(id, assocBtn));
+
     } else if (type === 'browser') {
       const nav       = document.createElement('div');
       nav.className   = 'browser-nav';
@@ -2084,7 +2987,7 @@
       const webview = document.createElement('webview');
       webview.className = 'browser-view';
       webview.setAttribute('src', initialUrl);
-      webview.setAttribute('partition', 'persist:aiconsole');
+      webview.setAttribute('partition', 'persist:aide');
       webview.setAttribute('allowpopups', '');
       webview.addEventListener('dom-ready', () => webview.setBackgroundColor('#1e1e1e'));
 
@@ -2170,7 +3073,10 @@
         showCtxMenu(items, rect.left, rect.bottom);
       });
 
-      header.append(title, cmdSaveBtn, cmdDropBtn, detachBtn, settingsBtn, closeBtn);
+      const assocIndicator = document.createElement('span');
+      assocIndicator.className  = 'assoc-indicator hidden';
+      assocIndicator.dataset.types = '';
+      header.append(title, assocIndicator, cmdSaveBtn, cmdDropBtn, detachBtn, settingsBtn, closeBtn);
       const termContainer = document.createElement('div');
       termContainer.className = 'term-container';
       paneEl.append(header, termContainer);
@@ -2199,6 +3105,13 @@
       terminal.loadAddon(fitAddon);
 
       // ── Clipboard: Ctrl+C copies selection (or sends interrupt), Ctrl+V pastes ──
+      // Block the browser's native paste event in capture phase so xterm's internal
+      // textarea handler doesn't also call onData — which would cause a double paste.
+      // stopPropagation() is required: preventDefault() alone only blocks the browser's
+      // default insertion, but xterm's listener on the textarea reads clipboardData
+      // directly and still fires, causing a second writePty call.
+      termContainer.addEventListener('paste', (e) => { e.preventDefault(); e.stopPropagation(); }, true);
+
       terminal.attachCustomKeyEventHandler((e) => {
         if (e.type !== 'keydown') return true;
         if (e.ctrlKey && e.key === 'c') {
@@ -2253,7 +3166,7 @@
         p.terminal.focus();
       });
 
-      const termData = { id, type: 'terminal', shell, cwd, initCommand, terminal, fitAddon, termContainer, element: paneEl, name: defaultName, ptyCreated: false, predefinedCommands: predefinedCommands ? [...predefinedCommands] : [] };
+      const termData = { id, type: 'terminal', shell, cwd, initCommand, terminal, fitAddon, termContainer, element: paneEl, name: defaultName, ptyCreated: false, isClaudePane: false, predefinedCommands: predefinedCommands ? [...predefinedCommands] : [] };
       panes.set(id, termData);
       globalPanes.set(id, termData);
       refreshCmdDropBtn();
@@ -2304,7 +3217,7 @@
       console.log('[initNewTerminals] creating PTY id:', pane.id, 'cols:', cols, 'rows:', rows);
       let ptyResult;
       try {
-        ptyResult = await window.electronAPI.createPty(pane.id, cols, rows, pane.shell, pane.cwd);
+        ptyResult = await window.electronAPI.createPty(pane.id, cols, rows, pane.shell, pane.cwd, pane.name || null);
       } catch (e) {
         console.error('[initNewTerminals] createPty threw for id', pane.id, e);
         pane.terminal.writeln(`\x1b[1;31mFailed to start terminal: ${e.message}\x1b[0m`);
@@ -2434,6 +3347,11 @@
   window.electronAPI.onPtyExit(({ id }) => {
     const pane = globalPanes.get(id);
     if (pane?.terminal) pane.terminal.writeln('\r\n\x1b[31m[Process exited]\x1b[0m');
+    if (pane?.name && pane?.claudeSessionId && isClaudeCodePane(pane) && pane?.cwd) {
+      window.electronAPI.generateSummary(pane.claudeSessionId, pane.cwd).then(summary => {
+        if (summary) window.electronAPI.saveSummary(pane.name, summary);
+      }).catch(() => {});
+    }
   });
 
   let refitTimer = null;
@@ -2601,6 +3519,10 @@
           };
         } else if (pane.type === 'text') {
           return { type: 'text', name: pane.name || null, gridArea: pane.element.style.gridArea || '', filePath: pane.filePath || null };
+        } else if (pane.type === 'memory') {
+          return { type: 'memory', name: pane.name || null, gridArea: pane.element.style.gridArea || '', vaultPath: pane.vaultPath || null, openFilePath: pane.openFilePath || null, associatedCwds: pane.associatedCwds || [] };
+        } else if (pane.type === 'tasks') {
+          return { type: 'tasks', name: pane.name || null, gridArea: pane.element.style.gridArea || '', tasksPath: pane.tasksPath || null, associatedCwds: pane.associatedCwds || [] };
         } else {
           return { type: 'browser', name: pane.name || null, gridArea: pane.element.style.gridArea || '', url: pane.urlInput?.value || 'https://www.google.com' };
         }
@@ -2798,6 +3720,7 @@
     setupDropdowns();
 
     (async () => {
+      userDataPath = await window.electronAPI.getUserDataPath();
       await createTab('Tab 1');
 
       // Check for saved last state

@@ -3,3 +3,16 @@ dist/
 dist.7z
 stt-model/
 test.bin
+
+# Local tooling & private config
+.claude/
+.git/
+memory/
+tasks/
+data/
+scripts/
+.mcp.json
+mcp/
+requirements/
+*.lnk
+*.bck
