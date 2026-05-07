@@ -1,5 +1,5 @@
 const { app, BrowserWindow, ipcMain, nativeTheme, shell, dialog, Menu, Tray, nativeImage, clipboard } = require('electron');
-app.setAppUserModelId('com.aiconsole.app');
+app.setAppUserModelId('com.aide.app');
 Menu.setApplicationMenu(null);
 nativeTheme.themeSource = 'dark';
 const path = require('path');
@@ -109,7 +109,24 @@ function createWindow() {
   });
 }
 
+// ── Deploy MCP scripts to userData on startup ──────────────────────────────
+function deployMcpScripts() {
+  const srcDir  = path.join(__dirname, 'mcp');
+  const destDir = path.join(app.getPath('userData'), 'mcp');
+  if (!fs.existsSync(srcDir)) return;
+  try {
+    if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+    for (const file of fs.readdirSync(srcDir)) {
+      fs.copyFileSync(path.join(srcDir, file), path.join(destDir, file));
+    }
+  } catch (e) {
+    console.error('[mcp] deploy failed:', e.message);
+  }
+}
+
 app.whenReady().then(() => {
+  deployMcpScripts();
+
   let pty = null;
   let ptyLoadError = null;
   try {
@@ -120,6 +137,8 @@ app.whenReady().then(() => {
   }
 
   ipcMain.handle('shells:list', () => getAvailableShells());
+
+  ipcMain.handle('app:getUserDataPath', () => app.getPath('userData'));
 
   ipcMain.on('clipboard:read',  (e)      => { e.returnValue = clipboard.readText(); });
   ipcMain.on('clipboard:write', (e, txt) => { clipboard.writeText(txt); e.returnValue = null; });
@@ -234,6 +253,13 @@ app.whenReady().then(() => {
     } catch (e) { return { success: false, error: e.message }; }
   });
 
+  ipcMain.handle('fs:ensureDir', (event, dirPath) => {
+    try {
+      fs.mkdirSync(dirPath, { recursive: true });
+      return { success: true };
+    } catch (e) { return { success: false, error: e.message }; }
+  });
+
   ipcMain.handle('dialog:openFile', async (event, { filters } = {}) => {
     if (!mainWindow) return null;
     const result = await dialog.showOpenDialog(mainWindow, {
@@ -263,19 +289,21 @@ app.whenReady().then(() => {
     return result.canceled ? null : result.filePaths[0];
   });
 
-  ipcMain.handle('pty:create', (event, { id, cols, rows, shell: shellPath, cwd }) => {
+  ipcMain.handle('pty:create', (event, { id, cols, rows, shell: shellPath, cwd, panelName }) => {
     if (!pty) return { success: false, error: `node-pty failed to load: ${ptyLoadError}` };
     const shell = shellPath || getShell();
     const args = (shell.includes('pwsh') || shell.includes('powershell')) ? ['-NoLogo'] : [];
     const startCwd = (cwd && fs.existsSync(cwd)) ? cwd : os.homedir();
     let ptyProcess;
     try {
+      const env = { ...process.env };
+      if (panelName) env.AIDE_PANEL_NAME = panelName;
       ptyProcess = pty.spawn(shell, args, {
         name: 'xterm-256color',
         cols: cols || 80,
         rows: rows || 24,
         cwd: startCwd,
-        env: process.env,
+        env,
       });
     } catch (e) {
       console.error('[pty:create] spawn failed:', e);
@@ -368,7 +396,7 @@ app.whenReady().then(() => {
 
     try {
       tray = new Tray(path.join(__dirname, 'favicon_dark.ico'));
-      tray.setToolTip('AIConsole — closing…');
+      tray.setToolTip('AIDE — closing…');
     } catch {}
 
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
@@ -414,9 +442,74 @@ app.whenReady().then(() => {
           const stat = fs.statSync(path.join(dir, f));
           return { name: f, mtime: stat.mtimeMs, btime: stat.birthtimeMs };
         })
-        .filter(f => !since || f.btime >= since)
+        .filter(f => !since || f.mtime >= since - 5000)
         .sort((a, b) => b.mtime - a.mtime);
       return files.length ? files[0].name.slice(0, -6) : null;
+    } catch { return null; }
+  });
+
+  function panelSummaryFile(panelName) {
+    const safe = panelName.replace(/[^a-zA-Z0-9_\- ]/g, '_').slice(0, 80);
+    return path.join(os.homedir(), '.claude', 'panel-summaries', safe + '.md');
+  }
+
+  ipcMain.handle('claude:getSummary', (event, { panelName }) => {
+    try {
+      const file = panelSummaryFile(panelName);
+      return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+    } catch { return null; }
+  });
+
+  ipcMain.handle('claude:saveSummary', (event, { panelName, summary }) => {
+    try {
+      const file = panelSummaryFile(panelName);
+      const dir = path.dirname(file);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file, summary, 'utf8');
+      return true;
+    } catch { return false; }
+  });
+
+  ipcMain.handle('claude:generateSummary', async (event, { sessionId, cwd }) => {
+    try {
+      const encoded = cwd.replace(/[:\\\/]/g, '-');
+      const file = path.join(os.homedir(), '.claude', 'projects', encoded, sessionId + '.jsonl');
+      if (!fs.existsSync(file)) return null;
+
+      const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+      const messages = [];
+      for (const line of lines) {
+        try {
+          const obj = JSON.parse(line);
+          if ((obj.type === 'user' || obj.type === 'assistant') && obj.message?.content) {
+            const raw = obj.message.content;
+            const text = typeof raw === 'string' ? raw
+              : Array.isArray(raw) ? raw.filter(b => b.type === 'text').map(b => b.text).join('\n')
+              : '';
+            if (text.trim()) messages.push(`${obj.type === 'user' ? 'User' : 'Claude'}: ${text.slice(0, 500)}`);
+          }
+        } catch {}
+      }
+      if (messages.length < 2) return null;
+
+      const transcript = messages.join('\n\n').slice(0, 4000);
+      const prompt = `Summarize this Claude Code conversation in 2-4 sentences. Focus on what was worked on, key decisions made, and any open items:\n\n${transcript}`;
+
+      const { spawn } = require('child_process');
+      return await new Promise((resolve) => {
+        const proc = spawn('claude', ['-p', '--no-session-persistence', '--tools', ''], {
+          cwd: os.homedir(),
+          env: process.env,
+        });
+        proc.stdin.write(prompt, 'utf8');
+        proc.stdin.end();
+        let output = '';
+        proc.stdout.on('data', d => { output += d; });
+        proc.on('close', () => resolve(output.trim() || null));
+        proc.on('error', () => resolve(null));
+        const timer = setTimeout(() => { try { proc.kill(); } catch {} resolve(null); }, 30000);
+        proc.on('close', () => clearTimeout(timer));
+      });
     } catch { return null; }
   });
 
@@ -427,7 +520,7 @@ app.whenReady().then(() => {
       height: 700,
       backgroundColor: '#1e1e1e',
       icon: path.join(__dirname, 'favicon_dark.ico'),
-      title: config.name || 'AIConsole',
+      title: config.name || 'AIDE',
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
         contextIsolation: true,
