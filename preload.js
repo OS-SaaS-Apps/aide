@@ -1,8 +1,8 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  createPty: (id, cols, rows, shell, cwd) =>
-    ipcRenderer.invoke('pty:create', { id, cols, rows, shell, cwd }),
+  createPty: (id, cols, rows, shell, cwd, panelName) =>
+    ipcRenderer.invoke('pty:create', { id, cols, rows, shell, cwd, panelName }),
 
   openDirectoryPicker: (title) =>
     ipcRenderer.invoke('dialog:openDirectory', { title }),
@@ -33,6 +33,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   writeTextFile: (filePath, content) =>
     ipcRenderer.invoke('fs:writeTextFile', { filePath, content }),
+
+  ensureDir: (dirPath) =>
+    ipcRenderer.invoke('fs:ensureDir', dirPath),
 
   openFilePicker: (filters) =>
     ipcRenderer.invoke('dialog:openFile', { filters }),
@@ -84,6 +87,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getClaudeSessionId: (cwd, since) =>
     ipcRenderer.invoke('claude:getSessionId', { cwd, since }),
 
+  generateSummary: (sessionId, cwd) =>
+    ipcRenderer.invoke('claude:generateSummary', { sessionId, cwd }),
+
+  getSummary: (panelName) =>
+    ipcRenderer.invoke('claude:getSummary', { panelName }),
+
+  saveSummary: (panelName, summary) =>
+    ipcRenderer.invoke('claude:saveSummary', { panelName, summary }),
+
   listSessions: () =>
     ipcRenderer.invoke('session:list'),
 
@@ -127,4 +139,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   onSttStatusChange: (callback) =>
     ipcRenderer.on('stt:status-change', (event, state) => callback(state)),
+
+  getUserDataPath: () => ipcRenderer.invoke('app:getUserDataPath'),
 });

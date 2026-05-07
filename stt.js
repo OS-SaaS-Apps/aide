@@ -46,7 +46,7 @@ function downloadFile(url, destPath, onProgress) {
   return new Promise((resolve, reject) => {
     const follow = (url, depth) => {
       if (depth > 10) return reject(new Error('Too many redirects'));
-      const req = https.get(url, { headers: { 'User-Agent': 'AIConsole/1.0' } }, (res) => {
+      const req = https.get(url, { headers: { 'User-Agent': 'AIDE/1.0' } }, (res) => {
         if ([301, 302, 307, 308].includes(res.statusCode)) {
           res.resume();
           return follow(res.headers.location, depth + 1);
