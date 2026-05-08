@@ -599,6 +599,10 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
         webviews.forEach(wv => wv.style.pointerEvents = '');
         overlay.removeEventListener('mousemove', onMove);
         overlay.removeEventListener('mouseup',   onUp);
+        // Convert absolute px track sizes to fr so the layout scales correctly
+        // when the container grows (e.g. moving to a larger screen / going fullscreen).
+        gridEl.style.gridTemplateRows    = normalizePxToFr(gridEl.style.gridTemplateRows);
+        gridEl.style.gridTemplateColumns = normalizePxToFr(gridEl.style.gridTemplateColumns);
         requestAnimationFrame(updateHandles);
         refitAll();
       }
@@ -1154,7 +1158,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     }
 
     let nameInput = null;
-    let shellInput = null, cwdInput = null, initCmdInput = null;
+    let shellInput = null, cwdInput = null, initCmdInput = null, claudeCheck = null;
     let urlInput = null;
     let dirInput = null;
     let fileInput = null;
@@ -1189,7 +1193,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       const claudeLabel = document.createElement('label');
       claudeLabel.className = 'dialog-label';
       claudeLabel.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;';
-      const claudeCheck = document.createElement('input');
+      claudeCheck = document.createElement('input');
       claudeCheck.type    = 'checkbox';
       claudeCheck.checked = !!pane.isClaudePane;
       claudeLabel.append(claudeCheck, 'Claude Code pane');
@@ -3766,8 +3770,8 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
           } else {
             grid.className = 'tab-grid';
             if (_snapshot.gridTemplateAreas)   grid.style.gridTemplateAreas   = _snapshot.gridTemplateAreas;
-            if (_snapshot.gridTemplateColumns) grid.style.gridTemplateColumns = _snapshot.gridTemplateColumns;
-            if (_snapshot.gridTemplateRows)    grid.style.gridTemplateRows    = _snapshot.gridTemplateRows;
+            if (_snapshot.gridTemplateColumns) grid.style.gridTemplateColumns = normalizePxToFr(_snapshot.gridTemplateColumns);
+            if (_snapshot.gridTemplateRows)    grid.style.gridTemplateRows    = normalizePxToFr(_snapshot.gridTemplateRows);
           }
           // Restore remaining panes to their original positions
           for (const { id: pid, area } of _snapshot.paneAreas) {
