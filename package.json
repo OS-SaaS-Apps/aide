@@ -68,6 +68,8 @@
       "!node_modules/node-pty/node-addon-api/**",
       "!node_modules/node-pty/third_party/**",
       "!node_modules/node-pty/scripts/**",
+      "mcp/**",
+      "!mcp/*.log",
       "layouts.conf",
       "stt-model/**",
       "favicon_dark.ico"
