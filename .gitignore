@@ -21,3 +21,5 @@ requirements/
 check_dependency.md
 compile.bat
 use_docker.md
+CLAUDE.md
+layouts.conf
