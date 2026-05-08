@@ -22,7 +22,7 @@
   "build": {
     "appId": "com.aide.app",
     "productName": "AIDE",
-    "icon": "favicon_dark.ico",
+    "icon": "images/favicon_dark.ico",
     "npmRebuild": true,
     "asarUnpack": [
       "node_modules/node-pty/**",
@@ -71,7 +71,7 @@
       "!mcp/*.log",
       "layouts.conf",
       "stt-model/**",
-      "favicon_dark.ico"
+      "images/**"
     ]
   }
 }
