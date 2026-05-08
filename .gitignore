@@ -16,3 +16,8 @@ mcp/
 requirements/
 *.lnk
 *.bck
+*.bat
+.npmrc
+check_dependency.md
+compile.bat
+use_docker.md
