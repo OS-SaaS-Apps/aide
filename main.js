@@ -71,7 +71,7 @@ function createWindow() {
     width: 1200,
     height: 800,
     backgroundColor: '#1e1e1e',
-    icon: path.join(__dirname, 'favicon_dark.ico'),
+    icon: path.join(__dirname, 'images', 'favicon_dark.ico'),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -395,7 +395,7 @@ app.whenReady().then(() => {
     isShuttingDown = true;
 
     try {
-      tray = new Tray(path.join(__dirname, 'favicon_dark.ico'));
+      tray = new Tray(path.join(__dirname, 'images', 'favicon_dark.ico'));
       tray.setToolTip('AIDE — closing…');
     } catch {}
 
@@ -519,7 +519,7 @@ app.whenReady().then(() => {
       width: 900,
       height: 700,
       backgroundColor: '#1e1e1e',
-      icon: path.join(__dirname, 'favicon_dark.ico'),
+      icon: path.join(__dirname, 'images', 'favicon_dark.ico'),
       title: config.name || 'AIDE',
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
