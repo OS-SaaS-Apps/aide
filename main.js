@@ -12,7 +12,7 @@ let tray = null;
 let isShuttingDown = false;
 const ptyProcesses = new Map();
 const ptyToSender  = new Map(); // maps pty id → webContents.id (for routing data to correct window)
-const stt = require('./stt');
+const stt = require('./stt/stt');
 
 // ── Session / last-state helpers ───────────────────────
 function sessionsFilePath()  { return path.join(app.getPath('userData'), 'sessions.json'); }

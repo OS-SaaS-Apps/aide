@@ -27,7 +27,7 @@
     "asarUnpack": [
       "node_modules/node-pty/**",
       "node_modules/sherpa-onnx/**",
-      "stt-worker.js",
+      "stt/stt-worker.js",
       "stt-model/**"
     ],
     "win": {
@@ -53,8 +53,7 @@
     "files": [
       "main.js",
       "preload.js",
-      "stt.js",
-      "stt-worker.js",
+      "stt/**",
       "renderer/**",
       "node_modules/**",
       "!node_modules/node-pty/build/Release/obj",
