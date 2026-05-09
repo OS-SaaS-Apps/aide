@@ -1,6 +1,10 @@
 # AIDE
 
-A tiled workspace built with Electron — combine terminal, browser, file explorer, text editor, and AI-oriented panes in any layout.
+A tiled workspace built with Electron, designed for the emerging paradigm of **agentic coding** — where humans orchestrate, coordinate and brainstorm with AI agents.
+
+AIDE brings together terminals, a browser, a file explorer, a text editor, a memory vault, and a task board in a single configurable window. Panes are not isolated: a memory vault wires directly into every terminal's AI agent via MCP, a task board surfaces shared work items across sessions, the layout is fully user-defined through a simple ASCII-art notation or a menu and it supports multiple independent tabs for parallel projects.
+
+The pane model is deliberately open-ended. New pane types can be added to extend the workspace for any workflow. This makes AIDE a practical foundation for **new software development processes** — from solo developer setups to collaborative human-AI pipelines and lowers the bar for **non-technical contributors** (business analysts, managers, domain experts) to participate directly in agentic development workflows without needing a traditional IDE.
 
 ![AIDE workspace with multiple open panes](docs/capture.png)
 
