@@ -1,6 +1,6 @@
 # AIDE
 
-A tiled workspace built with Electron — combine terminal, browser, file explorer, text editor, and Claude Code integration panes in any layout.
+A tiled workspace built with Electron — combine terminal, browser, file explorer, text editor, and AI-oriented panes in any layout.
 
 ![AIDE workspace with multiple open panes](docs/capture.png)
 
