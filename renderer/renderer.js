@@ -1,19 +1,86 @@
 (() => {
-  const MAX_PANES = 6; // limit for the + button
+  const MAX_PANES = 12; // limit for the + button (matches GRID_AREAS)
   const GRID_AREAS = ['a','b','c','d','e','f','g','h','i','j','k','l'];
 
-  // Inject --resume <sessionId> into a claude init command
-  function withClaudeResume(initCmd, sessionId) {
-    if (!sessionId || !initCmd) return initCmd || null;
-    const base = initCmd.replace(/\s*--resume\s+[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '').trim();
-    return base.replace(/(\bclaude(?:\.exe)?\b)/i, `$1 --resume ${sessionId}`);
+  // ── Claude session ownership ──────────────────────────
+  // Each Claude pane owns a UUID generated when the pane is created. The first launch
+  // passes it as --session-id (Claude adopts it), later launches pass --resume. Nothing
+  // is ever sniffed from ~/.claude/projects, so panes sharing a cwd can't collide.
+  function isClaudeCommand(cmd) {
+    return !!cmd && /\bclaude(?:\.exe)?\b/i.test(cmd);
+  }
+
+  // Drop any session flag already present so we never emit two of them — Claude refuses
+  // --session-id alongside --resume/--continue. Covers every form (-r, -c, --flag=value,
+  // quoted or missing values) so a stale flag saved in a layout can't break the launch.
+  // Only the arguments after `claude` are touched (e.g. `bash -c "claude"` keeps its -c).
+  function stripClaudeSessionFlags(cmd) {
+    const m = /\bclaude(?:\.exe)?\b/i.exec(cmd);
+    if (!m) return cmd.trim();
+    const head = cmd.slice(0, m.index + m[0].length);
+    const tail = cmd.slice(head.length)
+      .replace(/\s+(?:--continue|-c)(?=[\s"']|$)/gi, '')
+      .replace(/\s+(?:--resume|-r|--session-id)(?:(?:=|\s+)(?:"[^"]*"|'[^']*'|(?!-)[^\s"']+))?(?=[\s"']|$)/gi, '');
+    return (head + tail).trim();
+  }
+
+  function withClaudeSession(initCmd, sessionId, resume) {
+    if (!sessionId || !isClaudeCommand(initCmd)) return initCmd || null;
+    const flag = resume ? '--resume' : '--session-id';
+    // Inject AIDE's settings (prompt-archive hook) unless the user passes their own
+    const cmd = stripClaudeSessionFlags(initCmd);
+    const settings = userDataPath && !/--settings\b/i.test(cmd)
+      ? ` --settings "${pathJoin(userDataPath, 'mcp', 'aide-claude-settings.json')}"` : '';
+    return cmd.replace(/(\bclaude(?:\.exe)?\b)/i, `$1 ${flag} ${sessionId}${settings}`);
+  }
+
+  // Only persist the id once the session really exists on disk — resuming an id that was
+  // minted but never launched would make Claude fail on the next start.
+  function savedClaudeSessionId(pane) {
+    return pane.claudeResume ? (pane.claudeSessionId || null) : null;
+  }
+
+  // An id belongs to exactly one pane. Saved layouts written by older builds (which sniffed
+  // the newest transcript in the pane's cwd) can hand the same id to several panes, which
+  // would all resume the same conversation — so anything but the first claimant starts fresh.
+  function claudeSessionIdTaken(sessionId, exceptPaneId = null) {
+    if (!sessionId) return false;
+    for (const p of globalPanes.values()) {
+      if (p.id === exceptPaneId) continue;
+      if (p.claudeSessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  // Resuming is only safe when nobody else owns the id and Claude's transcript for it is
+  // still on disk — `--resume` on a missing session aborts the launch.
+  async function canResumeClaude(pane) {
+    if (!pane.claudeSessionId) return false;
+    if (claudeSessionIdTaken(pane.claudeSessionId, pane.id)) return false;
+    if (!pane.cwd) return true;
+    try {
+      return await window.electronAPI.claudeSessionExists(pane.claudeSessionId, pane.cwd);
+    } catch { return true; }
+  }
+
+  function newClaudeSessionId() {
+    return (crypto.randomUUID?.() ||
+      'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = Math.random() * 16 | 0;
+        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+      }));
   }
 
   const _urlParams     = new URLSearchParams(window.location.search);
   const isDetached     = _urlParams.has('detached');
   const detachedConfig = isDetached ? JSON.parse(_urlParams.get('config') || '{}') : null;
 
-  const globalPanes = new Map();   // all panes across all tabs (for PTY routing)
+  const globalPanes = new Map();   // all panes across all tabs
+  // PTY ids must be unique across *all* windows (main + detached), since the main process
+  // keeps one map of them — pane ids alone would collide. The key travels with the pane
+  // when it is detached, so the running shell moves instead of being respawned.
+  const WIN_TAG   = Math.random().toString(36).slice(2, 8);
+  const ptyPanes  = new Map();     // pty key → pane (for routing PTY data)
   let draggedPaneId = null;        // pane currently being dragged (for swap)
   let lastFocusedTerminalId = null; // for STT injection
   const tabs = new Map();
@@ -23,11 +90,17 @@
   let grid;    // → active tab's gridEl   (updated by switchTab)
   let nextId = 1;
   let userDataPath = '';           // resolved once at startup
+  let layoutCategories = null;     // all known layouts, grouped by category (for View menu + welcome screen)
 
   // OS-aware path join (renderer has no access to node:path)
   function pathJoin(base, ...parts) {
     const sep = base.includes('\\') ? '\\' : '/';
     return [base, ...parts].join(sep);
+  }
+
+  // Terminal and SSH panes share the xterm + pty machinery; only the backend differs.
+  function isTermPane(pane) {
+    return pane.type === 'terminal' || pane.type === 'ssh';
   }
 
   // ── Claude Code pane detection ────────────────────────
@@ -324,6 +397,12 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     4: { gridClass: 'layout-quad',    areas: ['a','b','c','d'] },
     5: { gridCSS: { gridTemplateAreas: '"a b" "c d" "e e"', gridTemplateColumns: 'repeat(2, 1fr)', gridTemplateRows: 'repeat(3, 1fr)' }, areas: ['a','b','c','d','e'] },
     6: { gridCSS: { gridTemplateAreas: '"a b c" "d e f"', gridTemplateColumns: 'repeat(3, 1fr)', gridTemplateRows: 'repeat(2, 1fr)' }, areas: ['a','b','c','d','e','f'] },
+    7: { gridCSS: { gridTemplateAreas: '"a b c" "d e f" "g g g"', gridTemplateColumns: 'repeat(3, 1fr)', gridTemplateRows: 'repeat(3, 1fr)' }, areas: ['a','b','c','d','e','f','g'] },
+    8: { gridCSS: { gridTemplateAreas: '"a b c d" "e f g h"', gridTemplateColumns: 'repeat(4, 1fr)', gridTemplateRows: 'repeat(2, 1fr)' }, areas: ['a','b','c','d','e','f','g','h'] },
+    9: { gridCSS: { gridTemplateAreas: '"a b c" "d e f" "g h i"', gridTemplateColumns: 'repeat(3, 1fr)', gridTemplateRows: 'repeat(3, 1fr)' }, areas: ['a','b','c','d','e','f','g','h','i'] },
+   10: { gridCSS: { gridTemplateAreas: '"a b c d" "e f g h" "i i j j"', gridTemplateColumns: 'repeat(4, 1fr)', gridTemplateRows: 'repeat(3, 1fr)' }, areas: ['a','b','c','d','e','f','g','h','i','j'] },
+   11: { gridCSS: { gridTemplateAreas: '"a b c d" "e f g h" "i i j k"', gridTemplateColumns: 'repeat(4, 1fr)', gridTemplateRows: 'repeat(3, 1fr)' }, areas: ['a','b','c','d','e','f','g','h','i','j','k'] },
+   12: { gridCSS: { gridTemplateAreas: '"a b c d" "e f g h" "i j k l"', gridTemplateColumns: 'repeat(4, 1fr)', gridTemplateRows: 'repeat(3, 1fr)' }, areas: ['a','b','c','d','e','f','g','h','i','j','k','l'] },
   };
 
   // ── Layout parser ─────────────────────────────────────
@@ -491,8 +570,12 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       grid.style.gridTemplateRows    = layout.gridCSS.gridTemplateRows;
     }
     const list = [...panes.values()];
-    for (let i = 0; i < list.length; i++)
+    for (let i = 0; i < list.length; i++) {
+      // A pane left maximized would cover the layout we just built.
+      list[i].element.classList.remove('pane-maximized');
+      list[i].element._syncMaximizeBtn?.();
       list[i].element.style.gridArea = areas[i] || '';
+    }
     grid._updateResizeHandles?.();
   }
 
@@ -616,14 +699,16 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
   }
 
   // ── Layout icon (mini grid preview) ──────────────────
+  const SLOT_TYPE = { T: 'terminal', B: 'browser', E: 'explorer', X: 'text' };
+
   function makeLayoutIcon(layout) {
     const rows    = layout.icon;
     const nrows   = rows.length;
     const ncols   = rows[0].length;
-    const letters = ['a', 'b', 'c', 'd', 'e', 'f'];
+    const letters = GRID_AREAS;
 
     const templateAreas = rows
-      .map(row => `"${row.map(n => letters[n - 1]).join(' ')}"`)
+      .map(row => `"${row.map(n => (n ? letters[n - 1] : '.')).join(' ')}"`)
       .join(' ');
 
     const div = document.createElement('div');
@@ -635,12 +720,12 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     const seen = new Set();
     for (const row of rows) {
       for (const idx of row) {
-        if (seen.has(idx)) continue;
+        if (!idx || seen.has(idx)) continue;   // 0 = empty cell
         seen.add(idx);
         const cell = document.createElement('div');
         cell.style.gridArea = letters[idx - 1];
         const slot = layout.slots[idx - 1];
-        const iconType = slot === 'T' ? 'terminal' : slot === 'E' ? 'explorer' : slot === 'X' ? 'text' : 'browser';
+        const iconType = SLOT_TYPE[slot] || slot || 'terminal';
         cell.className = `icon-cell icon-${iconType}`;
         div.appendChild(cell);
       }
@@ -648,10 +733,111 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     return div;
   }
 
+  // ── Designer layouts (layouts.json) ───────────────────
+  // Wrapped into the same shape as an ASCII layout so the View menu, the
+  // welcome screen and makeLayoutIcon can treat both alike.  `.model` marks it
+  // as designer-authored (track sizes + per-panel settings included).
+  function layoutFromCustom(entry) {
+    const model = LayoutModel.fromJSON(entry.model);
+    const css   = LayoutModel.modelToCss(model);
+
+    const idxByUid = {};
+    css.order.forEach((p, i) => { idxByUid[p.uid] = i + 1; });
+    const icon = Array.from({ length: model.rows }, () => new Array(model.cols).fill(0));
+    for (const p of css.order)
+      for (let r = p.r0; r < p.r1; r++)
+        for (let c = p.c0; c < p.c1; c++)
+          icon[r][c] = idxByUid[p.uid];
+
+    return {
+      label:    entry.name,
+      customId: entry.id,
+      model,
+      slots:    css.order.map(p => p.type),
+      areas:    css.order.map(p => css.areaByUid[p.uid]),
+      gridCSS: {
+        gridTemplateAreas:   css.gridTemplateAreas,
+        gridTemplateColumns: css.gridTemplateColumns,
+        gridTemplateRows:    css.gridTemplateRows,
+      },
+      icon,
+    };
+  }
+
+  async function loadCustomLayouts() {
+    try {
+      const entries = await window.electronAPI.loadCustomLayouts();
+      return (entries || []).map(e => {
+        try { return layoutFromCustom(e); }
+        catch (err) { console.warn(`Saved layout "${e?.name}" skipped:`, err.message); return null; }
+      }).filter(Boolean);
+    } catch (e) {
+      console.warn('Failed to load layouts.json:', e);
+      return [];
+    }
+  }
+
+  // ── Load layouts (from layouts.conf, falling back to built-ins) ──────
+  async function loadAllLayouts() {
+    let categorized;
+    try {
+      const text = await window.electronAPI.loadLayouts();
+      if (text) {
+        const parsed = parseConfigFile(text);
+        if (parsed.length > 0) categorized = categorize(parsed);
+      }
+    } catch (e) {
+      console.warn('Failed to load layouts config:', e);
+    }
+    if (!categorized) {
+      const parsed = BUILTIN_ASCII.map(({ name, art }) =>
+        parseAsciiLayout(name, art.split('\n'))
+      );
+      categorized = categorize(parsed);
+    }
+    categorized.custom = await loadCustomLayouts();
+    return categorized;
+  }
+
+  // Re-read layouts.json and rebuild everything that lists layouts.
+  async function refreshLayoutMenus() {
+    layoutCategories = await loadAllLayouts();
+    buildViewMenu(document.getElementById('view-menu'), layoutCategories);
+    updateWelcomeScreen();
+  }
+
+  // All ASCII (non-designer) layouts, flattened — used by the designer sidebar.
+  function flatAsciiLayouts() {
+    const c = layoutCategories || {};
+    return [
+      ...(c.terminal || []), ...(c.browser || []), ...(c.explorer || []),
+      ...(c.text || []),     ...(c.mixed   || []),
+    ];
+  }
+
   // ── View menu ─────────────────────────────────────────
   function buildViewMenu(viewMenu, categorized) {
     viewMenu.innerHTML = '';
+
+    // First slot: the visual layout designer.
+    const designerBtn = document.createElement('button');
+    designerBtn.className = 'dropdown-item';
+    designerBtn.innerHTML =
+      '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" ' +
+      'stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/>' +
+      '<line x1="3" y1="10" x2="21" y2="10"/><line x1="10" y1="10" x2="10" y2="21"/></svg>' +
+      '<span>Designer …</span>';
+    designerBtn.addEventListener('click', () => {
+      viewMenu.classList.add('hidden');
+      openLayoutDesigner();
+    });
+    viewMenu.appendChild(designerBtn);
+    const designerSep = document.createElement('div');
+    designerSep.className = 'dropdown-sep';
+    viewMenu.appendChild(designerSep);
+
     const cats = [
+      { key: 'custom',   label: 'My Layouts'   },
       { key: 'terminal', label: 'Terminals'    },
       { key: 'browser',  label: 'Browsers'     },
       { key: 'explorer', label: 'Explorers'    },
@@ -703,6 +889,36 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     viewMenu.appendChild(footer);
   }
 
+  // ── Layout designer bridge ────────────────────────────
+  let designerReady = false;
+
+  function openLayoutDesigner() {
+    if (!window.LayoutDesigner) return;
+    if (!designerReady) {
+      window.LayoutDesigner.init({
+        // Snapshot of the active tab, with live pane ids attached
+        modelFromCurrentTab: () => LayoutModel.modelFromGrid(grid, panes),
+        // Keeps the preview's proportions honest
+        getGridAspect: () => {
+          const r = grid.getBoundingClientRect();
+          return (r.width > 0 && r.height > 0) ? r.width / r.height : 16 / 9;
+        },
+        applyModel:        (model, opts) => applyModel(model, opts),
+        getAsciiTemplates: () => flatAsciiLayouts(),
+        parseAsciiLayout,
+        makeLayoutIcon,
+        confirm:            showConfirmDialog,
+        paneConfigFields:   (box, type, values) => buildPaneConfigFields(box, type, values, { restartHint: false }),
+        listShells:         () => window.electronAPI.listShells(),
+        pickDirectory:      (title) => window.electronAPI.openDirectoryPicker(title),
+        openConfigFile:     () => window.electronAPI.openConfigFile(),
+        onTemplatesChanged: () => refreshLayoutMenus(),
+      });
+      designerReady = true;
+    }
+    window.LayoutDesigner.open();
+  }
+
   // ── Custom layout dialog ──────────────────────────────
   function openCustomLayoutDialog() {
     const overlay  = document.getElementById('custom-layout-dialog');
@@ -752,6 +968,149 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     okBtn.addEventListener('click', onOk);
     cancelBtn.addEventListener('click', onCancel);
     overlay.addEventListener('keydown', onKey);
+  }
+
+  // ── Welcome screen (shown in a tab with no panes yet) ────────────────
+  function buildWelcomeScreen() {
+    const el = document.createElement('div');
+    el.className = 'welcome-screen';
+    el.style.gridArea = 'a';
+
+    const content = document.createElement('div');
+    content.className = 'welcome-content';
+    el.appendChild(content);
+
+    content.innerHTML = `
+      <h1 class="welcome-title">AIDE</h1>
+      <p class="welcome-subtitle">A tiled workspace for <strong>agentic coding</strong> — where you orchestrate and
+      collaborate with AI agents across terminals, browsers, a file explorer, a text editor, a memory
+      vault, and a task board, all in one configurable window.</p>
+      <p class="welcome-subtitle">Panes aren't isolated: a memory vault wires straight into every terminal's AI agent via MCP,
+      a task board tracks shared work across sessions, and each tab keeps its own independent layout so
+      you can run several projects side by side.</p>
+    `;
+
+    // ── Designer (primary path) ──
+    const designerLabel = document.createElement('div');
+    designerLabel.className = 'welcome-section-label';
+    designerLabel.textContent = 'Design your workspace';
+    content.appendChild(designerLabel);
+
+    const designerCard = document.createElement('div');
+    designerCard.className = 'welcome-designer-card';
+    designerCard.innerHTML = `
+      <div class="welcome-designer-art" aria-hidden="true">
+        <span class="wd-cell wd-a"></span><span class="wd-cell wd-b"></span>
+        <span class="wd-cell wd-c"></span><span class="wd-cell wd-d"></span>
+        <span class="wd-cursor">＋</span>
+      </div>
+      <div class="welcome-designer-text">
+        <h2>Layout Designer</h2>
+        <p>Build the exact split you want: add panes, drag them around, split a pane
+        side-by-side or top/bottom, and drag the grid lines to resize.</p>
+        <p>Set each pane's type, name, folder and start-up command up front, then apply it
+        here or in a new tab. Save what you like as a template — it shows up in the
+        <strong>View</strong> menu next time.</p>
+      </div>`;
+    content.appendChild(designerCard);
+
+    const designerBtnRow = document.createElement('div');
+    designerBtnRow.className = 'welcome-designer-actions';
+    const designerBtn = document.createElement('button');
+    designerBtn.className = 'welcome-designer-btn';
+    designerBtn.textContent = '🎛  Open the layout designer';
+    designerBtn.addEventListener('click', () => openLayoutDesigner());
+    const designerHint = document.createElement('span');
+    designerHint.className = 'welcome-designer-hint';
+    designerHint.textContent = 'Also in View ▾ → Designer …';
+    designerBtnRow.append(designerBtn, designerHint);
+    content.appendChild(designerBtnRow);
+
+    const layoutLabel = document.createElement('div');
+    layoutLabel.className = 'welcome-section-label';
+    layoutLabel.textContent = 'Or start from a ready-made layout';
+    content.appendChild(layoutLabel);
+
+    const layoutGrid = document.createElement('div');
+    layoutGrid.className = 'welcome-layout-grid';
+    content.appendChild(layoutGrid);
+
+    const cats = layoutCategories || {};
+    const allLayouts = [
+      ...(cats.custom   || []),
+      ...(cats.terminal || []), ...(cats.browser || []), ...(cats.explorer || []),
+      ...(cats.text || []),     ...(cats.mixed   || []),
+    ];
+    for (const layout of allLayouts) {
+      const card = document.createElement('button');
+      card.className = 'welcome-layout-card';
+      card.appendChild(makeLayoutIcon(layout));
+      const label = document.createElement('span');
+      label.textContent = layout.label;
+      card.appendChild(label);
+      card.addEventListener('click', async () => { await applyLayout(layout); });
+      layoutGrid.appendChild(card);
+    }
+
+    const customLabel = document.createElement('div');
+    customLabel.className = 'welcome-section-label';
+    customLabel.textContent = 'Or type a layout as ASCII';
+    content.appendChild(customLabel);
+
+    const customRow = document.createElement('div');
+    customRow.className = 'welcome-custom-row';
+    const textarea = document.createElement('textarea');
+    textarea.className = 'url-bar welcome-custom-input';
+    textarea.rows = 3;
+    textarea.spellcheck = false;
+    textarea.placeholder = '1 = Terminal  2 = Browser  3 = Explorer  4 = Text Editor\ne.g.\n12\n 2';
+    const applyBtn = document.createElement('button');
+    applyBtn.className = 'toolbar-btn';
+    applyBtn.textContent = 'Apply';
+    customRow.append(textarea, applyBtn);
+    content.appendChild(customRow);
+
+    const errorEl = document.createElement('div');
+    errorEl.className = 'dialog-hint welcome-custom-error';
+    errorEl.style.display = 'none';
+    content.appendChild(errorEl);
+
+    applyBtn.addEventListener('click', async () => {
+      const raw = textarea.value;
+      if (!raw.trim()) {
+        errorEl.textContent = 'Please enter a layout.';
+        errorEl.style.display = '';
+        return;
+      }
+      let layout;
+      try {
+        layout = parseAsciiLayout('Custom', raw.split('\n'));
+      } catch (e) {
+        errorEl.textContent = e.message;
+        errorEl.style.display = '';
+        return;
+      }
+      errorEl.style.display = 'none';
+      await applyLayout(layout);
+    });
+
+    return el;
+  }
+
+  // Shows/hides the welcome screen for the active tab based on its pane count.
+  // Reads tab.panes directly (not the module-level `panes`) so it stays correct
+  // even when called while that global is briefly out of sync with activeTabId
+  // (e.g. mid-way through restoreAllTabs).
+  function updateWelcomeScreen() {
+    if (isDetached) return;
+    const tab = tabs.get(activeTabId);
+    if (!tab) return;
+    const existing = tab.gridEl.querySelector(':scope > .welcome-screen');
+    if (tab.panes.size === 0) {
+      if (!existing) tab.gridEl.appendChild(buildWelcomeScreen());
+    } else if (existing) {
+      existing.remove();
+    }
   }
 
   // ── Shell submenu ─────────────────────────────────────
@@ -1103,7 +1462,364 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     });
   }
 
+  // ── Prompt archive dialog ─────────────────────────────
+  async function showPromptArchiveDialog() {
+    const overlay  = document.getElementById('prompt-archive-dialog');
+    const list     = document.getElementById('prompt-archive-list');
+    const searchEl = document.getElementById('prompt-archive-search');
+    const countEl  = document.getElementById('prompt-archive-count');
+
+    const result = await window.electronAPI.readPromptArchive();
+    let entries = [];
+    if (result.success && result.content) {
+      entries = result.content.trim().split('\n').filter(Boolean).reverse();
+    }
+
+    function renderList(filter) {
+      const lf = (filter || '').toLowerCase();
+      const shown = lf ? entries.filter(e => e.toLowerCase().includes(lf)) : entries;
+      countEl.textContent = shown.length === entries.length
+        ? `${entries.length} prompts`
+        : `${shown.length} of ${entries.length} prompts`;
+      list.innerHTML = '';
+      if (!shown.length) {
+        const empty = document.createElement('div');
+        empty.className = 'prompt-archive-empty';
+        empty.textContent = entries.length ? 'No prompts match the filter.' : 'No prompts archived yet.';
+        list.appendChild(empty);
+        return;
+      }
+      for (const line of shown) {
+        const m = line.match(/^\[([^\]]+)\]\s+(?:\(([^)]*)\)\s+)?(.*)$/s);
+        const ts     = m ? m[1] : '';
+        const cwd    = m ? (m[2] || '') : '';
+        const prompt = m ? m[3] : line;
+
+        const row = document.createElement('div');
+        row.className = 'prompt-archive-row';
+        row.title = 'Click to copy';
+
+        const tsEl = document.createElement('span');
+        tsEl.className = 'prompt-archive-ts';
+        tsEl.textContent = ts;
+
+        const textEl = document.createElement('span');
+        textEl.className = 'prompt-archive-text';
+        textEl.textContent = prompt;
+
+        row.appendChild(tsEl);
+        row.appendChild(textEl);
+
+        if (cwd) {
+          const cwdEl = document.createElement('span');
+          cwdEl.className = 'prompt-archive-cwd';
+          cwdEl.textContent = cwd;
+          row.appendChild(cwdEl);
+        }
+
+        row.addEventListener('click', () => {
+          window.electronAPI.writeClipboard(prompt);
+          row.classList.add('copied');
+          setTimeout(() => row.classList.remove('copied'), 700);
+        });
+        list.appendChild(row);
+      }
+    }
+
+    renderList('');
+    searchEl.value = '';
+    overlay.classList.remove('hidden');
+    searchEl.focus();
+
+    searchEl.oninput = () => renderList(searchEl.value);
+
+    document.getElementById('prompt-archive-close').onclick = () => overlay.classList.add('hidden');
+
+    const bgClose = (e) => { if (e.target === overlay) overlay.classList.add('hidden'); };
+    overlay.addEventListener('click', bgClose);
+
+    document.getElementById('prompt-archive-clear').onclick = async () => {
+      const ok = await showConfirmDialog('Clear the entire prompt archive? This cannot be undone.', 'Clear', 'Cancel');
+      if (!ok) return;
+      await window.electronAPI.writeTextFile(result.filePath, '');
+      entries = [];
+      renderList('');
+    };
+
+    const escClose = (e) => { if (e.key === 'Escape') { overlay.classList.add('hidden'); document.removeEventListener('keydown', escClose); } };
+    document.addEventListener('keydown', escClose);
+  }
+
   // ── Pane settings dialog ──────────────────────────────
+  // Builds the settings fields for a pane type into `box`, and returns a
+  // read()/focus() handle.  Shared by the live pane dialog (which applies the
+  // values to a running pane) and the layout designer (which stores them on a
+  // panel spec, to be used when the pane is created).
+  //
+  // opts.restartHint  — false to drop the "(applies on restart)" hints
+  // opts.omitPaths    — true to hide memory/tasks folder fields (the live panes
+  //                     have no API to repoint them after creation)
+  // opts.omitCwd      — true to hide the terminal / explorer folder field
+  // opts.shells       — list from listShells(): shows the shell as a dropdown
+  function buildPaneConfigFields(box, type, values = {}, opts = {}) {
+    const restartHint = opts.restartHint === false ? '' : '(applies on restart)';
+    const refs = {};
+
+    const makeInput = (value, placeholder) => {
+      const inp = document.createElement('input');
+      inp.className   = 'url-bar';
+      inp.type        = 'text';
+      inp.spellcheck  = false;
+      inp.value       = value || '';
+      inp.placeholder = placeholder || '';
+      return inp;
+    };
+
+    const addField = (labelText, hintText, inputEl) => {
+      const field = document.createElement('div');
+      field.className = 'dialog-field';
+      const lbl = document.createElement('label');
+      lbl.className = 'dialog-label';
+      lbl.textContent = labelText;
+      if (hintText) {
+        const hint = document.createElement('span');
+        hint.className = 'dialog-hint';
+        hint.textContent = ' ' + hintText;
+        lbl.appendChild(hint);
+      }
+      field.append(lbl, inputEl);
+      box.appendChild(field);
+      return field;
+    };
+
+    const addBrowseField = (labelText, hintText, inp, onBrowse) => {
+      const row = document.createElement('div');
+      row.className = 'dialog-row';
+      const btn = document.createElement('button');
+      btn.className   = 'toolbar-btn';
+      btn.textContent = 'Browse…';
+      btn.addEventListener('click', onBrowse);
+      row.append(inp, btn);
+      return addField(labelText, hintText, row);
+    };
+
+    const pickDir = (inp, title) => async () => {
+      const dir = await window.electronAPI.openDirectoryPicker(title);
+      if (dir) inp.value = dir;
+    };
+
+    refs.name = makeInput(values.name, 'Panel name');
+    addField('Name', '', refs.name);
+
+    if (type === 'terminal') {
+      if (opts.shells) {
+        refs.shell = document.createElement('select');
+        refs.shell.className = 'url-bar';
+        const opt = (value, text) => {
+          const o = document.createElement('option');
+          o.value = value; o.textContent = text;
+          refs.shell.appendChild(o);
+        };
+        opt('', 'Default shell');
+        for (const sh of opts.shells) opt(sh.path, sh.label);
+        if (values.shell && !opts.shells.some(sh => sh.path === values.shell)) opt(values.shell, values.shell);
+        refs.shell.value = values.shell || '';
+      } else {
+        refs.shell = makeInput(values.shell, 'Default shell');
+      }
+      addField('Shell', restartHint, refs.shell);
+
+      if (!opts.omitCwd) {
+        refs.cwd = makeInput(values.cwd, 'Default directory');
+        addBrowseField('Working Directory', restartHint, refs.cwd, pickDir(refs.cwd));
+      }
+
+      refs.command = makeInput(values.command, 'e.g. npm run dev');
+      addField('Init Command', restartHint, refs.command);
+
+      const claudeField = document.createElement('div');
+      claudeField.className = 'dialog-field';
+      const claudeLabel = document.createElement('label');
+      claudeLabel.className = 'dialog-label';
+      claudeLabel.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;';
+      refs.isClaudePane = document.createElement('input');
+      refs.isClaudePane.type    = 'checkbox';
+      refs.isClaudePane.checked = !!values.isClaudePane;
+      claudeLabel.append(refs.isClaudePane, 'Claude Code pane');
+      claudeField.appendChild(claudeLabel);
+      box.appendChild(claudeField);
+
+    } else if (type === 'ssh') {
+      const picker = window.SshUI.buildProfilePicker(values.sshProfileId || null);
+      refs.sshProfileId = picker.select;
+      addField('SSH Profile', opts.restartHint === false ? '' : '(applies on reconnect)', picker.el);
+
+    } else if (type === 'browser') {
+      refs.url = makeInput(values.url, 'https://');
+      addField('URL', '', refs.url);
+
+    } else if (type === 'explorer' && !opts.omitCwd) {
+      refs.cwd = makeInput(values.cwd, 'Directory path');
+      addBrowseField('Directory', '', refs.cwd, pickDir(refs.cwd, 'Explorer — Select Root Folder'));
+
+    } else if (type === 'text') {
+      refs.filePath = makeInput(values.filePath, 'File path');
+      addBrowseField('File', '', refs.filePath, async () => {
+        const fp = await window.electronAPI.openFilePicker([
+          { name: 'Text / Code', extensions: ['txt','md','json','xml','html','css','js','ts','py','yaml','conf','log'] },
+          { name: 'All Files', extensions: ['*'] },
+        ]);
+        if (fp) refs.filePath.value = fp;
+      });
+
+    } else if (type === 'memory' && !opts.omitPaths) {
+      refs.vaultPath = makeInput(values.vaultPath, 'Vault folder');
+      addBrowseField('Vault Folder', '', refs.vaultPath, pickDir(refs.vaultPath, 'Memory — Select Vault Folder'));
+
+    } else if (type === 'tasks' && !opts.omitPaths) {
+      refs.tasksPath = makeInput(values.tasksPath, 'Tasks folder');
+      addBrowseField('Tasks Folder', '', refs.tasksPath, pickDir(refs.tasksPath, 'Tasks — Select Folder'));
+    }
+
+    return {
+      refs,
+      focus() { refs.name?.focus(); refs.name?.select(); },
+      read() {
+        const out = {};
+        for (const [key, el] of Object.entries(refs))
+          out[key] = el.type === 'checkbox' ? el.checked : (el.value.trim() || null);
+        return out;
+      },
+    };
+  }
+
+  // ── Quick tab ─────────────────────────────────────────
+  // A throwaway tab with a single panel. Quick tabs are never saved or restored.
+  const QUICK_TYPES = [
+    ['terminal', 'Terminal'], ['ssh', 'SSH'], ['browser', 'Browser'], ['explorer', 'Explorer'],
+    ['text', 'Text editor'], ['memory', 'Memory'], ['tasks', 'Tasks'],
+  ];
+  let quickTabSeq = 1;
+
+  async function showQuickTabDialog() {
+    const [tempDir, shells] = await Promise.all([
+      window.electronAPI.getTempPath().catch(() => ''),
+      window.electronAPI.listShells().catch(() => []),
+    ]);
+
+    const overlay = document.createElement('div');
+    overlay.className = 'dialog-overlay';
+    document.body.appendChild(overlay);
+
+    const box = document.createElement('div');
+    box.className = 'dialog-box';
+    overlay.appendChild(box);
+
+    const title = document.createElement('div');
+    title.className = 'dialog-title';
+    title.textContent = 'Quick Tab';
+    box.appendChild(title);
+
+    const addField = (labelText, el) => {
+      const field = document.createElement('div');
+      field.className = 'dialog-field';
+      const lbl = document.createElement('label');
+      lbl.className = 'dialog-label';
+      lbl.textContent = labelText;
+      field.append(lbl, el);
+      box.appendChild(field);
+    };
+
+    const tabName = document.createElement('input');
+    tabName.className = 'url-bar';
+    tabName.type = 'text';
+    tabName.spellcheck = false;
+    tabName.value = `Quick ${quickTabSeq}`;
+    addField('Tab Name', tabName);
+
+    const folderRow = document.createElement('div');
+    folderRow.className = 'dialog-row';
+    const folder = document.createElement('input');
+    folder.className = 'url-bar';
+    folder.type = 'text';
+    folder.spellcheck = false;
+    folder.value = tempDir || '';
+    folder.placeholder = 'Folder';
+    const browse = document.createElement('button');
+    browse.className = 'toolbar-btn';
+    browse.textContent = 'Browse…';
+    browse.addEventListener('click', async () => {
+      const dir = await window.electronAPI.openDirectoryPicker('Quick Tab — Folder');
+      if (dir) folder.value = dir;
+    });
+    folderRow.append(folder, browse);
+    addField('Folder', folderRow);
+
+    const typeSel = document.createElement('select');
+    typeSel.className = 'url-bar';
+    for (const [value, text] of QUICK_TYPES) {
+      const o = document.createElement('option');
+      o.value = value; o.textContent = text;
+      typeSel.appendChild(o);
+    }
+    addField('Panel', typeSel);
+
+    const cfgBox = document.createElement('div');
+    box.appendChild(cfgBox);
+    let fields = null;
+    const buildCfg = () => {
+      cfgBox.innerHTML = '';
+      fields = buildPaneConfigFields(cfgBox, typeSel.value, {}, { restartHint: false, omitCwd: true, shells });
+    };
+    typeSel.addEventListener('change', buildCfg);
+    buildCfg();
+
+    const actions = document.createElement('div');
+    actions.className = 'dialog-actions';
+    const okBtn = document.createElement('button');
+    okBtn.className = 'toolbar-btn';
+    okBtn.textContent = 'Apply';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'toolbar-btn dialog-cancel-btn';
+    cancelBtn.textContent = 'Cancel';
+    actions.append(okBtn, cancelBtn);
+    box.appendChild(actions);
+
+    tabName.focus();
+    tabName.select();
+
+    const close = () => overlay.remove();
+
+    const apply = async () => {
+      const type = typeSel.value;
+      const v    = fields.read();
+      const dir  = folder.value.trim() || null;
+      const cfg  = { ...v };
+      delete cfg.name;
+      if (type === 'terminal' || type === 'explorer') cfg.cwd = dir;
+      if (type === 'terminal' && v.command && isClaudeCommand(v.command)) cfg.isClaudePane = true;
+      close();
+      const name = tabName.value.trim() || `Quick ${quickTabSeq}`;
+      quickTabSeq++;
+
+      const id = await createTab(name);
+      tabs.get(id).quick = true;
+      renderTabBar();
+      createPaneFromSpec({ type, name: v.name || null, cfg }, null);
+      updateDefaultLayout();
+      updateAddButton();
+      await initNewTerminals();
+    };
+
+    okBtn.addEventListener('click', apply);
+    cancelBtn.addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    box.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') { e.stopPropagation(); apply(); }
+      if (e.key === 'Escape') { e.stopPropagation(); close(); }
+    });
+  }
+
   function showPaneSettingsDialog(pane) {
     if (!pane) return;
 
@@ -1120,121 +1836,16 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     dlgTitle.textContent = 'Pane Settings';
     box.appendChild(dlgTitle);
 
-    function makeField(labelText, hintText, inputEl) {
-      const field = document.createElement('div');
-      field.className = 'dialog-field';
-      const lbl = document.createElement('label');
-      lbl.className = 'dialog-label';
-      lbl.textContent = labelText;
-      if (hintText) {
-        const hint = document.createElement('span');
-        hint.className = 'dialog-hint';
-        hint.textContent = ' ' + hintText;
-        lbl.appendChild(hint);
-      }
-      field.append(lbl, inputEl);
-      box.appendChild(field);
-    }
-
-    function makeInput(value, placeholder) {
-      const inp = document.createElement('input');
-      inp.className = 'url-bar';
-      inp.type = 'text';
-      inp.spellcheck = false;
-      inp.value = value || '';
-      inp.placeholder = placeholder || '';
-      return inp;
-    }
-
-    function makeRowWithBrowse(inp, browseCallback) {
-      const row = document.createElement('div');
-      row.className = 'dialog-row';
-      const btn = document.createElement('button');
-      btn.className = 'toolbar-btn';
-      btn.textContent = 'Browse…';
-      btn.addEventListener('click', browseCallback);
-      row.append(inp, btn);
-      return row;
-    }
-
-    let nameInput = null;
-    let shellInput = null, cwdInput = null, initCmdInput = null, claudeCheck = null;
-    let urlInput = null;
-    let dirInput = null;
-    let fileInput = null;
-
-    if (pane.type === 'terminal' || pane.type === 'browser') {
-      nameInput = makeInput(pane.name, 'Panel name');
-      makeField('Name', '', nameInput);
-    }
-
-    if (pane.type === 'terminal') {
-      shellInput = makeInput(pane.shell || '', 'Default shell');
-      makeField('Shell', '(applies on restart)', shellInput);
-
-      cwdInput = makeInput(pane.cwd || '', 'Default directory');
-      const cwdRow = makeRowWithBrowse(cwdInput, async () => {
-        const dir = await window.electronAPI.openDirectoryPicker();
-        if (dir) cwdInput.value = dir;
-      });
-      const cwdField = document.createElement('div');
-      cwdField.className = 'dialog-field';
-      const cwdLbl = document.createElement('label');
-      cwdLbl.className = 'dialog-label';
-      cwdLbl.innerHTML = 'Working Directory <span class="dialog-hint">(applies on restart)</span>';
-      cwdField.append(cwdLbl, cwdRow);
-      box.appendChild(cwdField);
-
-      initCmdInput = makeInput(pane.initCommand || '', 'e.g. npm run dev');
-      makeField('Init Command', '(applies on restart)', initCmdInput);
-
-      const claudeRow = document.createElement('div');
-      claudeRow.className = 'dialog-field';
-      const claudeLabel = document.createElement('label');
-      claudeLabel.className = 'dialog-label';
-      claudeLabel.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;';
-      claudeCheck = document.createElement('input');
-      claudeCheck.type    = 'checkbox';
-      claudeCheck.checked = !!pane.isClaudePane;
-      claudeLabel.append(claudeCheck, 'Claude Code pane');
-      claudeRow.appendChild(claudeLabel);
-      box.appendChild(claudeRow);
-
-    } else if (pane.type === 'browser') {
-      urlInput = makeInput(pane.urlInput?.value || '', 'https://');
-      makeField('URL', '', urlInput);
-
-    } else if (pane.type === 'explorer') {
-      dirInput = makeInput(pane.cwd || '', 'Directory path');
-      const dirRow = makeRowWithBrowse(dirInput, async () => {
-        const dir = await window.electronAPI.openDirectoryPicker();
-        if (dir) dirInput.value = dir;
-      });
-      const dirField = document.createElement('div');
-      dirField.className = 'dialog-field';
-      const dirLbl = document.createElement('label');
-      dirLbl.className = 'dialog-label';
-      dirLbl.textContent = 'Directory';
-      dirField.append(dirLbl, dirRow);
-      box.appendChild(dirField);
-
-    } else if (pane.type === 'text') {
-      fileInput = makeInput(pane.filePath || '', 'File path');
-      const fileRow = makeRowWithBrowse(fileInput, async () => {
-        const fp = await window.electronAPI.openFilePicker([
-          { name: 'Text / Code', extensions: ['txt','md','json','xml','html','css','js','ts','py','yaml','conf','log'] },
-          { name: 'All Files', extensions: ['*'] },
-        ]);
-        if (fp) fileInput.value = fp;
-      });
-      const fileField = document.createElement('div');
-      fileField.className = 'dialog-field';
-      const fileLbl = document.createElement('label');
-      fileLbl.className = 'dialog-label';
-      fileLbl.textContent = 'File';
-      fileField.append(fileLbl, fileRow);
-      box.appendChild(fileField);
-    }
+    const fields = buildPaneConfigFields(box, pane.type, {
+      name:         pane.name,
+      shell:        pane.shell,
+      cwd:          pane.cwd,
+      command:      pane.initCommand,
+      isClaudePane: pane.isClaudePane,
+      sshProfileId: pane.sshProfileId,
+      url:          pane.urlInput?.value,
+      filePath:     pane.filePath,
+    }, { omitPaths: true });
 
     const actions = document.createElement('div');
     actions.className = 'dialog-actions';
@@ -1247,38 +1858,41 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     actions.append(okBtn, cancelBtn);
     box.appendChild(actions);
 
-    const firstInput = nameInput || shellInput || dirInput || fileInput || urlInput;
-    if (firstInput) { firstInput.focus(); firstInput.select(); }
+    fields.focus();
 
     const close = () => document.body.removeChild(overlay);
 
     const apply = async () => {
-      if (nameInput) {
-        const newName = nameInput.value.trim();
-        if (newName) {
-          pane.name = newName;
-          const titleSpan = pane.element.querySelector('.pane-title');
-          if (titleSpan) titleSpan.textContent = newName;
-        }
+      const v = fields.read();
+      if (v.name) {
+        pane.name = v.name;
+        const titleSpan = pane.element.querySelector('.pane-title');
+        if (titleSpan) titleSpan.textContent = v.name;
       }
       if (pane.type === 'terminal') {
-        pane.shell       = shellInput.value.trim() || null;
-        pane.cwd         = cwdInput.value.trim() || null;
-        pane.initCommand = initCmdInput.value.trim() || null;
-        pane.isClaudePane = claudeCheck.checked;
+        pane.shell        = v.shell;
+        pane.cwd          = v.cwd;
+        pane.initCommand  = isClaudeCommand(v.command) ? stripClaudeSessionFlags(v.command) : v.command;
+        pane.isClaudePane = v.isClaudePane;
+        // A pane that has just become a Claude pane needs a session id of its own
+        if (isClaudeCommand(pane.initCommand) && !pane.claudeSessionId) {
+          pane.claudeSessionId = newClaudeSessionId();
+          pane.claudeResume    = false;
+        }
+      } else if (pane.type === 'ssh') {
+        pane.sshProfileId = v.sshProfileId;
+        if (pane.sshDisconnected) reconnectSsh(pane);
       } else if (pane.type === 'browser') {
-        let url = urlInput.value.trim();
+        let url = v.url;
         if (url) {
           if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'https://' + url;
           pane.urlInput.value = url;
           pane.webview.setAttribute('src', url);
         }
       } else if (pane.type === 'explorer') {
-        const path = dirInput.value.trim();
-        if (path && pane.navigate) await pane.navigate(path);
+        if (v.cwd && pane.navigate) await pane.navigate(v.cwd);
       } else if (pane.type === 'text') {
-        const fp = fileInput.value.trim();
-        if (fp && pane.openFile) await pane.openFile(fp);
+        if (v.filePath && pane.openFile) await pane.openFile(v.filePath);
       }
       close();
     };
@@ -1341,7 +1955,12 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     const saveBtn = document.createElement('button');
     saveBtn.className = 'dropdown-item';
     saveBtn.textContent = '💾 Save current session…';
-    saveBtn.addEventListener('click', () => showSaveSessionInput(menu));
+    if (tabs.get(activeTabId)?.quick) {
+      saveBtn.disabled = true;
+      saveBtn.title = 'Quick tabs cannot be saved';
+    } else {
+      saveBtn.addEventListener('click', () => showSaveSessionInput(menu));
+    }
     menu.appendChild(saveBtn);
 
     const sessions = await window.electronAPI.listSessions();
@@ -1396,7 +2015,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
         };
       } else if (pane.type === 'terminal') {
         const info = pane.ptyCreated
-          ? await window.electronAPI.getPaneInfo(pane.id)
+          ? await window.electronAPI.getPaneInfo(pane.ptyKey)
           : { cwd: null, command: null };
         return {
           gridArea: pane.element.style.gridArea || '',
@@ -1405,8 +2024,17 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
           shell: pane.shell,
           cwd: info.cwd || pane.cwd || null,
           initCommand: pane.initCommand || null,
-          claudeSessionId: pane.claudeSessionId || undefined,
+          isClaudePane: pane.isClaudePane || undefined,
+          claudeSessionId: savedClaudeSessionId(pane) || undefined,
           command: pane.lastCommand || info.command || null,
+          predefinedCommands: pane.predefinedCommands?.length ? pane.predefinedCommands : undefined,
+        };
+      } else if (pane.type === 'ssh') {
+        return {
+          gridArea: pane.element.style.gridArea || '',
+          type: 'ssh',
+          name: pane.name || null,
+          sshProfileId: pane.sshProfileId || null,
           predefinedCommands: pane.predefinedCommands?.length ? pane.predefinedCommands : undefined,
         };
       } else if (pane.type === 'text') {
@@ -1478,11 +2106,24 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       const initUrl = pd.type === 'browser' ? (pd.url      || null)
                     : pd.type === 'tasks'   ? (pd.tasksPath || null)
                     : null;
-      const initCmd = pd.type === 'terminal'
-        ? withClaudeResume(pd.initCommand || null, pd.claudeSessionId || null)
-        : pd.type === 'memory' ? (pd.openFilePath || null)
-        : (pd.initCommand || null);
-      createPane(pd.type, pd.gridArea || null, pd.shell || null, initCwd, initCmd, pd.name || null, initUrl, pd.predefinedCommands || null);
+      const initCmd = pd.type === 'memory' ? (pd.openFilePath || null) : (pd.initCommand || null);
+      const pid = createPane(pd.type, pd.gridArea || null, pd.shell || null, initCwd, initCmd, pd.name || null, initUrl, pd.predefinedCommands || null);
+      if (pd.type === 'ssh') setSshProfile(pid, pd.sshProfileId);
+      // The "Claude Code pane" flag is a user choice, not derivable from the command.
+      if (pd.type === 'terminal' && pd.isClaudePane) {
+        const cp = panes.get(pid);
+        if (cp) cp.isClaudePane = true;
+      }
+      // Reclaim the session this pane owned in the saved layout, so it resumes its own
+      // conversation rather than whichever one happens to be newest in the project dir.
+      if (pd.type === 'terminal' && pd.claudeSessionId) {
+        const rp = panes.get(pid);
+        // Duplicates are dropped: createPane already minted a fresh id for this pane.
+        if (rp && !claudeSessionIdTaken(pd.claudeSessionId, rp.id)) {
+          rp.claudeSessionId = pd.claudeSessionId;
+          rp.claudeResume    = true;
+        }
+      }
     }
 
     // Restore associatedCwds on memory/tasks panes, then rebuild associatedPaneIds
@@ -1541,6 +2182,10 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     document.addEventListener('click', closeAll);
     allMenus.forEach(m => m.addEventListener('click', (e) => e.stopPropagation()));
 
+    document.getElementById('btn-add-ssh').addEventListener('click', () => {
+      addMenu.classList.add('hidden');
+      addPane('ssh');
+    });
     document.getElementById('btn-add-browser').addEventListener('click', () => {
       addMenu.classList.add('hidden');
       addPane('browser');
@@ -1564,83 +2209,180 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
   }
 
   // ── Apply layout ──────────────────────────────────────
-  async function applyLayout(layout) {
-    const slots    = layout.slots;
-    const existing = [...panes.values()];
-    const pool     = { terminal: [], browser: [], explorer: [], text: [] };
-    for (const p of existing) pool[p.type]?.push(p);
+  //
+  // Everything funnels through applyModel(): the View menu, the welcome
+  // screen, the custom-ASCII box and the designer all build a LayoutModel
+  // first.  Panels carrying a `paneId` reuse that live pane (its PTY, page or
+  // editor buffer survives); everything else is created fresh.
 
-    const matched = slots.map(slot => {
-      const type = slot === 'T' ? 'terminal' : slot === 'E' ? 'explorer' : slot === 'X' ? 'text' : 'browser';
-      return pool[type].length > 0 ? pool[type].shift() : null;
-    });
-    for (const arr of Object.values(pool))
-      for (const p of arr) destroyPane(p.id);
+  function createPaneFromSpec(panel, area) {
+    const cfg  = panel.cfg || {};
+    const type = panel.type;
+    const cwd  = type === 'text'   ? (cfg.filePath  || null)
+               : type === 'memory' ? (cfg.vaultPath || null)
+               : (cfg.cwd || null);
+    const url  = type === 'browser' ? (cfg.url       || null)
+               : type === 'tasks'   ? (cfg.tasksPath || null)
+               : null;
+    const initCommand = type === 'terminal' ? (cfg.command || null) : null;
+    const id = createPane(type, area, cfg.shell || null, cwd, initCommand, panel.name || null, url, null);
+    if (type === 'terminal' && cfg.isClaudePane) {
+      const pane = panes.get(id);
+      if (pane) pane.isClaudePane = true;
+    }
+    if (type === 'ssh') setSshProfile(id, cfg.sshProfileId);
+    return id;
+  }
 
-    // Ask for setup before touching the DOM
-    const newSetups = [];
-    const newTermCount = matched.filter((m, i) => m === null && slots[i] === 'T').length;
-    let termIdx = 0;
+  // Must run before initNewTerminals() — the profile is read when the session opens.
+  function setSshProfile(paneId, profileId) {
+    const pane = panes.get(paneId);
+    if (pane && pane.type === 'ssh') pane.sshProfileId = profileId || null;
+  }
 
-    let sharedTermSetup = null;
-    if (newTermCount > 1) {
-      const useSame = await showConfirmDialog(
-        `Apply the same initial command to all ${newTermCount} new terminals?`
-      );
-      if (useSame) {
-        sharedTermSetup = await showTerminalSetupDialog('Configure All New Terminals');
+  async function applyModel(model, { newTab = false } = {}) {
+    if (newTab) await createTab();
+
+    const css     = LayoutModel.modelToCss(model);
+    const ordered = css.order;
+
+    // A live terminal whose shell / folder / command was edited must be restarted:
+    // drop its paneId so it is recreated fresh with the new settings.
+    const norm = (v) => v || null;
+    for (const p of ordered) {
+      const live = p.paneId != null ? panes.get(p.paneId) : null;
+      if (!live) continue;
+      const cfg = p.cfg || {};
+      if (live.type === 'terminal' &&
+          (norm(cfg.shell) !== norm(live.shell) || norm(cfg.cwd) !== norm(live.cwd) ||
+           norm(cfg.command) !== norm(live.initCommand))) {
+        p.paneId = null;
+        continue;
       }
+      if (p.name && p.name !== live.name) {
+        live.name = p.name;
+        const titleSpan = live.element.querySelector('.pane-title');
+        if (titleSpan) titleSpan.textContent = p.name;
+      }
+      if (live.type === 'terminal') live.isClaudePane = !!cfg.isClaudePane;
     }
 
-    for (let i = 0; i < slots.length; i++) {
-      if (matched[i] === null && slots[i] === 'T') {
-        termIdx++;
-        if (sharedTermSetup) {
-          newSetups.push({ cwd: sharedTermSetup.cwd, command: sharedTermSetup.command, name: `Terminal ${termIdx}` });
-        } else {
-          const title = newTermCount > 1 ? `New Terminal ${termIdx} of ${newTermCount}` : 'New Terminal';
-          newSetups.push(await showTerminalSetupDialog(title));
-        }
-      } else if (matched[i] === null && slots[i] === 'E') {
-        const dir = await window.electronAPI.openDirectoryPicker('Explorer — Select Root Folder');
-        newSetups.push({ cwd: dir, command: null });
-      } else if (matched[i] === null && slots[i] === 'X') {
-        newSetups.push({ cwd: null, command: null });
-      } else {
-        newSetups.push(null);
-      }
-    }
+    // Panes not referenced by the new model are closed.
+    const keep = new Set();
+    for (const p of ordered) if (p.paneId != null && panes.has(p.paneId)) keep.add(p.paneId);
+    for (const id of [...panes.keys()]) if (!keep.has(id)) destroyPane(id);
 
-    const areas = layout.areas;
-    setGrid(layout, []); // apply grid CSS before panes exist
+    grid.className = 'tab-grid';
+    grid.style.gridTemplateAreas   = css.gridTemplateAreas;
+    grid.style.gridTemplateColumns = css.gridTemplateColumns;
+    grid.style.gridTemplateRows    = css.gridTemplateRows;
 
     // Create all pane DOM first (no PTY yet) so the grid is fully populated
-    for (let i = 0; i < slots.length; i++) {
-      const area = areas[i];
-      if (matched[i]) {
-        grid.appendChild(matched[i].element);
-        matched[i].element.style.gridArea = area;
+    for (const p of ordered) {
+      const area = css.areaByUid[p.uid];
+      const live = p.paneId != null ? panes.get(p.paneId) : null;
+      if (live) {
+        grid.appendChild(live.element);
+        live.element.classList.remove('pane-maximized');   // a maximized pane would cover the new layout
+        live.element._syncMaximizeBtn?.();
+        live.element.style.gridArea = area;
       } else {
-        const setup = newSetups[i];
-        const paneType = slots[i] === 'T' ? 'terminal' : slots[i] === 'E' ? 'explorer' : slots[i] === 'X' ? 'text' : 'browser';
-        createPane(paneType, area, null, setup?.cwd, setup?.command, setup?.name || null);
+        createPaneFromSpec(p, area);
       }
     }
+
+    grid._updateResizeHandles?.();
     updateAddButton();
     refitAll();                  // refit existing (reused) terminals
     await initNewTerminals();    // fit + PTY for newly created terminals
   }
 
+  // Bind unclaimed live panes to same-typed panels, then ask for the settings
+  // the layout doesn't already carry.
+  async function prepareModelForApply(model) {
+    const m = LayoutModel.clone(model);
+    const pool = { terminal: [], ssh: [], browser: [], explorer: [], text: [], memory: [], tasks: [] };
+    const claimed = new Set(m.panels.map(p => p.paneId).filter(id => id != null));
+    for (const pane of panes.values())
+      if (!claimed.has(pane.id)) pool[pane.type]?.push(pane);
+
+    const ordered = LayoutModel.readingOrder(m);
+    for (const p of ordered) {
+      if (p.paneId != null) continue;
+      const reuse = pool[p.type]?.shift();
+      if (reuse) {
+        p.paneId = reuse.id;
+        if (!p.name) p.name = reuse.name || null;
+        // A reused terminal keeps its own settings (applyModel restarts on a mismatch).
+        if (reuse.type === 'terminal')
+          p.cfg = { shell: reuse.shell || null, cwd: reuse.cwd || null,
+                    command: reuse.initCommand || null, isClaudePane: !!reuse.isClaudePane };
+      }
+    }
+
+    const fresh     = ordered.filter(p => p.paneId == null);
+    const needsSetup = (p) => p.type === 'terminal' && !p.cfg.command && !p.cfg.cwd;
+    const newTerms  = fresh.filter(needsSetup);
+
+    let shared = null;
+    if (newTerms.length > 1) {
+      const useSame = await showConfirmDialog(
+        `Apply the same initial command to all ${newTerms.length} new terminals?`
+      );
+      if (useSame) shared = await showTerminalSetupDialog('Configure All New Terminals');
+    }
+
+    let termIdx = 0;
+    for (const p of fresh) {
+      if (needsSetup(p)) {
+        termIdx++;
+        if (shared) {
+          p.cfg = { ...p.cfg, cwd: shared.cwd, command: shared.command };
+          if (!p.name) p.name = `Terminal ${termIdx}`;
+        } else {
+          const title = newTerms.length > 1 ? `New Terminal ${termIdx} of ${newTerms.length}` : 'New Terminal';
+          const setup = await showTerminalSetupDialog(title);
+          p.cfg = { ...p.cfg, cwd: setup.cwd, command: setup.command };
+        }
+      } else if (p.type === 'explorer' && !p.cfg.cwd) {
+        p.cfg = { ...p.cfg, cwd: await window.electronAPI.openDirectoryPicker('Explorer — Select Root Folder') };
+      } else if (p.type === 'ssh' && !p.cfg.sshProfileId) {
+        p.cfg = { ...p.cfg, sshProfileId: await window.SshUI.showSetupDialog(p.name ? `SSH — ${p.name}` : 'New SSH Session') };
+      }
+    }
+    return m;
+  }
+
+  // `layout` is either a parsed ASCII layout or a designer layout (has .model).
+  async function applyLayout(layout) {
+    const model = layout.model
+      ? LayoutModel.resolveDefaults(layout.model)
+      : LayoutModel.modelFromAscii(layout);
+    await applyModel(await prepareModelForApply(model));
+  }
+
   // ── Add pane (+ button) ───────────────────────────────
   async function addPane(type, shell = null) {
     if (panes.size >= MAX_PANES) return;
-    let cwd = null, initCommand = null;
+    let cwd = null, initCommand = null, sshProfileId = null;
     if (type === 'terminal') {
       ({ cwd, command: initCommand } = await showTerminalSetupDialog());
     } else if (type === 'explorer') {
       cwd = await window.electronAPI.openDirectoryPicker();
+    } else if (type === 'ssh') {
+      sshProfileId = await window.SshUI.showSetupDialog();
+      if (!sshProfileId) return;
     }
-    createPane(type, null, shell, cwd, initCommand);
+    // SSH panes are named after their profile; the name also keys the remote tmux session,
+    // so a second pane on the same profile gets its own.
+    let paneName = null;
+    if (sshProfileId) {
+      const base = window.SshUI.profileLabel(sshProfileId);
+      paneName = base;
+      for (let n = 2; [...globalPanes.values()].some(p => p.name === paneName); n++) paneName = `${base} ${n}`;
+    }
+    const newId = createPane(type, null, shell, cwd, initCommand, paneName);
+    if (type === 'ssh') setSshProfile(newId, sshProfileId);
     updateDefaultLayout();
     updateAddButton();
     try {
@@ -1658,7 +2400,12 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     if (pane.type === 'browser')
       return { type: 'browser',   name: pane.name, url: pane.urlInput?.value || 'https://www.google.com' };
     if (pane.type === 'terminal')
-      return { type: 'terminal',  name: pane.name, shell: pane.shell || null, cwd: pane.cwd || null, initCommand: pane.initCommand || null };
+      return { type: 'terminal',  name: pane.name, shell: pane.shell || null, cwd: pane.cwd || null, initCommand: pane.initCommand || null,
+               ptyKey: pane.ptyKey || null, claudeSessionId: savedClaudeSessionId(pane),
+               predefinedCommands: pane.predefinedCommands ? [...pane.predefinedCommands] : [] };
+    if (pane.type === 'ssh')
+      return { type: 'ssh',       name: pane.name, sshProfileId: pane.sshProfileId || null, ptyKey: pane.ptyKey || null,
+               predefinedCommands: pane.predefinedCommands ? [...pane.predefinedCommands] : [] };
     if (pane.type === 'explorer')
       return { type: 'explorer',  name: pane.name, cwd: pane.cwd || null };
     if (pane.type === 'memory')
@@ -1666,6 +2413,20 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     if (pane.type === 'tasks')
       return { type: 'tasks',     name: pane.name, tasksPath: pane.tasksPath || null };
     return   { type: 'text',      name: pane.name, filePath: pane.filePath || null };
+  }
+
+  // A pane arriving from another window (detach, or re-attach when that window closes) brings
+  // the key of its still-running PTY with it; initNewTerminals() adopts it instead of
+  // spawning a fresh shell, so the session and its scrollback survive the move.
+  function adoptDetachedPty(paneId, config) {
+    if (!config?.ptyKey) return;
+    const pane = panes.get(paneId);
+    if (!pane || !isTermPane(pane)) return;
+    pane.adoptPtyKey     = config.ptyKey;
+    if (config.claudeSessionId) {
+      pane.claudeSessionId = config.claudeSessionId;
+      pane.claudeResume    = true;   // that session is already running in the adopted PTY
+    }
   }
 
   // ── Create pane DOM (PTY deferred — call initNewTerminals afterwards) ─────
@@ -1680,7 +2441,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     const header = document.createElement('div');
     header.className = 'pane-header';
 
-    const defaultName = savedName || (type === 'terminal' ? `Terminal ${id}` : type === 'explorer' ? `Explorer ${id}` : type === 'memory' ? `Memory ${id}` : type === 'tasks' ? `Tasks ${id}` : `Browser ${id}`);
+    const defaultName = savedName || (type === 'terminal' ? `Terminal ${id}` : type === 'ssh' ? `SSH ${id}` : type === 'explorer' ? `Explorer ${id}` : type === 'memory' ? `Memory ${id}` : type === 'tasks' ? `Tasks ${id}` : `Browser ${id}`);
 
     const title = document.createElement('span');
     title.className   = 'pane-title';
@@ -1734,15 +2495,72 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       const config = getPaneConfig(pane);
       // Save the pane's grid position and the full grid layout so we can restore on reattach
       config.gridArea = pane.element.style.gridArea;
+      config._sourceTabId = activeTabId;
       config._snapshot = {
         gridClass:           grid.className.replace(/\btab-grid\b|\bhidden\b/g, '').trim(),
         gridTemplateAreas:   grid.style.gridTemplateAreas   || null,
         gridTemplateColumns: grid.style.gridTemplateColumns || null,
         gridTemplateRows:    grid.style.gridTemplateRows    || null,
-        paneAreas: [...panes.values()].map(p => ({ id: p.id, area: p.element.style.gridArea })),
+        paneAreas: [...panes.values()].filter(p => p.id !== id).map(p => ({ id: p.id, area: p.element.style.gridArea })),
       };
       await window.electronAPI.detachPane(config);
-      closePane(id);
+      // Use destroyPane instead of closePane to avoid updateDefaultLayout() wiping the
+      // custom layout. Then restore the snapshot so remaining panes stay in their original
+      // positions (same logic as pane:reattach uses on the way back in).
+      // keepPty: the new window adopts the running shell — killing it here would restart it.
+      destroyPane(id, { keepPty: !!config.ptyKey });
+      const snap = config._snapshot;
+      if (snap.gridClass) {
+        grid.className = 'tab-grid ' + snap.gridClass;
+        grid.style.removeProperty('grid-template-areas');
+        grid.style.removeProperty('grid-template-columns');
+        grid.style.removeProperty('grid-template-rows');
+      } else {
+        grid.className = 'tab-grid';
+        if (snap.gridTemplateAreas)   grid.style.gridTemplateAreas   = snap.gridTemplateAreas;
+        if (snap.gridTemplateColumns) grid.style.gridTemplateColumns = snap.gridTemplateColumns;
+        if (snap.gridTemplateRows)    grid.style.gridTemplateRows    = snap.gridTemplateRows;
+      }
+      for (const { id: pid, area } of snap.paneAreas) {
+        const p = panes.get(pid);
+        if (p) p.element.style.gridArea = area;
+      }
+      grid._updateResizeHandles?.();
+      updateAddButton();
+      refitAll();
+      const last = [...panes.values()].pop();
+      if (last?.terminal) last.terminal.focus();
+    });
+
+    // ── Maximize / restore within the main window ─────────
+    const MAXIMIZE_ICON = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>';
+    const RESTORE_ICON  = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/><line x1="14" y1="10" x2="21" y2="3"/><line x1="3" y1="21" x2="10" y2="14"/></svg>';
+
+    const maxBtn = document.createElement('button');
+    maxBtn.className = 'pane-settings-btn';
+    maxBtn.title     = 'Maximize';
+    maxBtn.innerHTML = MAXIMIZE_ICON;
+    if (isDetached) maxBtn.style.display = 'none';
+    // Called on this pane and on any other pane we force out of maximized state,
+    // so the icon always matches the actual class.
+    paneEl._syncMaximizeBtn = () => {
+      const on = paneEl.classList.contains('pane-maximized');
+      maxBtn.innerHTML = on ? RESTORE_ICON : MAXIMIZE_ICON;
+      maxBtn.title     = on ? 'Restore' : 'Maximize';
+    };
+    maxBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const maximized = paneEl.classList.toggle('pane-maximized');
+      // Only one pane at a time may be maximized; the others keep their grid slots.
+      if (maximized) {
+        for (const p of globalPanes.values()) {
+          if (p.element === paneEl) continue;
+          p.element.classList.remove('pane-maximized');
+          p.element._syncMaximizeBtn?.();
+        }
+      }
+      paneEl._syncMaximizeBtn();
+      refitAll();
     });
 
     // ── Pane swap via drag ────────────────────────────────
@@ -1798,7 +2616,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       pathInput.placeholder = 'Enter path or click ⋯';
 
       nav.append(upBtn, pathInput, sortBtn, refreshBtn, openBtn);
-      header.append(title, nav, detachBtn, settingsBtn, closeBtn);
+      header.append(title, nav, maxBtn, detachBtn, settingsBtn, closeBtn);
 
       // ── Column header row ─────────────────────────────
       const colDefs = {
@@ -1976,7 +2794,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       fileLabel.className = 'text-editor-path';
 
       nav.append(openBtn, fileLabel, saveBtn, saveAsBtn, reloadBtn);
-      header.append(title, nav, detachBtn, settingsBtn, closeBtn);
+      header.append(title, nav, maxBtn, detachBtn, settingsBtn, closeBtn);
 
       // Format toolbar (shown based on file type)
       const toolbar = document.createElement('div');
@@ -2431,7 +3249,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       pathLabel.textContent = cwd ? cwd.split(/[\\/]/).pop() : 'No vault selected';
 
       nav.append(folderBtn, pathLabel, newNoteBtn, newFolderBtn, refreshBtn, assocBtn);
-      header.append(title, nav, detachBtn, settingsBtn, closeBtn);
+      header.append(title, nav, maxBtn, detachBtn, settingsBtn, closeBtn);
 
       const body = document.createElement('div');
       body.className = 'memory-body';
@@ -2725,7 +3543,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       pathLabel.textContent = url ? url.split(/[\\/]/).pop() : 'No folder selected';
 
       nav.append(folderBtn, pathLabel, refreshBtn, showAllBtn, assocBtn);
-      header.append(title, nav, detachBtn, settingsBtn, closeBtn);
+      header.append(title, nav, maxBtn, detachBtn, settingsBtn, closeBtn);
 
       const board = document.createElement('div');
       board.className = 'tasks-board';
@@ -2986,7 +3804,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       urlInput.spellcheck = false;
 
       nav.append(backBtn, fwdBtn, reloadBtn, urlInput);
-      header.append(title, nav, detachBtn, settingsBtn, closeBtn);
+      header.append(title, nav, maxBtn, detachBtn, settingsBtn, closeBtn);
 
       const webview = document.createElement('webview');
       webview.className = 'browser-view';
@@ -3064,7 +3882,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
               icon: '',
               label: cmd,
               action: () => {
-                if (pane.ptyCreated) window.electronAPI.writePty(pane.id, cmd);
+                if (pane.ptyCreated) window.electronAPI.writePty(pane.ptyKey, cmd);
                 pane.terminal.focus();
               },
               onContextMenu: () => {
@@ -3080,7 +3898,20 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       const assocIndicator = document.createElement('span');
       assocIndicator.className  = 'assoc-indicator hidden';
       assocIndicator.dataset.types = '';
-      header.append(title, assocIndicator, cmdSaveBtn, cmdDropBtn, detachBtn, settingsBtn, closeBtn);
+      // SSH panes show their connection state; clicking it when lost reconnects.
+      let sshDot = null;
+      if (type === 'ssh') {
+        sshDot = document.createElement('span');
+        sshDot.className = 'ssh-dot connecting';
+        sshDot.title     = 'Connecting…';
+        sshDot.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const pane = globalPanes.get(id);
+          if (pane?.sshDisconnected) reconnectSsh(pane);
+        });
+        header.append(sshDot);
+      }
+      header.append(title, assocIndicator, cmdSaveBtn, cmdDropBtn, maxBtn, detachBtn, settingsBtn, closeBtn);
       const termContainer = document.createElement('div');
       termContainer.className = 'term-container';
       paneEl.append(header, termContainer);
@@ -3108,6 +3939,21 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       const fitAddon = new FitAddon.FitAddon();
       terminal.loadAddon(fitAddon);
 
+      // ── OSC 52: let TUI apps (e.g. Claude Code fullscreen mode, which captures the
+      // mouse and does its own selection) set the clipboard. Format: "<targets>;<base64>".
+      // Clipboard reads ("?") are refused.
+      terminal.parser.registerOscHandler(52, (data) => {
+        const sep = data.indexOf(';');
+        if (sep < 0) return true;
+        const payload = data.slice(sep + 1);
+        if (!payload || payload === '?') return true;
+        try {
+          const bytes = Uint8Array.from(atob(payload), c => c.charCodeAt(0));
+          window.electronAPI.writeClipboard(new TextDecoder().decode(bytes));
+        } catch {}
+        return true;
+      });
+
       // ── Clipboard: Ctrl+C copies selection (or sends interrupt), Ctrl+V pastes ──
       // Block the browser's native paste event in capture phase so xterm's internal
       // textarea handler doesn't also call onData — which would cause a double paste.
@@ -3116,19 +3962,37 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       // directly and still fires, causing a second writePty call.
       termContainer.addEventListener('paste', (e) => { e.preventDefault(); e.stopPropagation(); }, true);
 
+      // Cache selection on mouseup so we can read it reliably in the keydown handler.
+      // xterm may clear the selection synchronously during its own keydown processing,
+      // before attachCustomKeyEventHandler runs, causing getSelection() to return ''.
+      // PTY child processes (e.g. Claude Code CLI) cannot write to the Windows clipboard
+      // from within a pseudo-console, so we must handle the copy in the Electron process.
+      let _pendingSelection = '';
+      termContainer.addEventListener('mouseup', () => {
+        _pendingSelection = terminal.getSelection();
+      });
+      termContainer.addEventListener('mousedown', (e) => {
+        if (!e.shiftKey) _pendingSelection = ''; // new click resets unless extending selection
+      });
+
       terminal.attachCustomKeyEventHandler((e) => {
         if (e.type !== 'keydown') return true;
         if (e.ctrlKey && e.key === 'c') {
-          const selection = terminal.getSelection();
+          const selection = terminal.getSelection() || _pendingSelection;
           if (selection) {
             window.electronAPI.writeClipboard(selection);
-            return false; // consumed
+            _pendingSelection = '';
+            terminal.clearSelection();
+            return false; // consumed — do not send \x03 to PTY
           }
-          return true; // pass through as interrupt
+          _pendingSelection = '';
+          return true; // no selection → pass through as interrupt
         }
         if (e.ctrlKey && e.key === 'v') {
           const text = window.electronAPI.readClipboard();
-          if (text) window.electronAPI.writePty(id, text);
+          // terminal.paste() normalizes newlines and adds \e[200~/\e[201~ brackets
+          // when the app enabled bracketed paste mode; it emits through onData → writePty.
+          if (text) terminal.paste(text);
           return false;
         }
         return true;
@@ -3142,7 +4006,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
           { icon: '', label: 'Copy',  disabled: !selection, action: () => window.electronAPI.writeClipboard(selection) },
           { icon: '', label: 'Paste', action: () => {
             const text = window.electronAPI.readClipboard();
-            if (text) window.electronAPI.writePty(id, text);
+            if (text) terminal.paste(text);
           }},
         ], e.clientX, e.clientY);
       });
@@ -3166,11 +4030,18 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
         const p = globalPanes.get(id);
         if (!p?.ptyCreated) return;
         const quoted = filePath.includes(' ') ? `"${filePath}"` : filePath;
-        window.electronAPI.writePty(id, quoted);
+        window.electronAPI.writePty(p.ptyKey, quoted);
         p.terminal.focus();
       });
 
-      const termData = { id, type: 'terminal', shell, cwd, initCommand, terminal, fitAddon, termContainer, element: paneEl, name: defaultName, ptyCreated: false, isClaudePane: false, predefinedCommands: predefinedCommands ? [...predefinedCommands] : [] };
+      // A Claude pane owns its session id from birth; callers that restore an existing
+      // session overwrite claudeSessionId/claudeResume right after createPane returns.
+      // SSH panes run their startup command on the server (from the profile), never locally.
+      if (type === 'ssh') { shell = null; cwd = null; initCommand = null; }
+      const isClaude = isClaudeCommand(initCommand);
+      if (isClaude) initCommand = stripClaudeSessionFlags(initCommand);
+      const termData = { id, type: type === 'ssh' ? 'ssh' : 'terminal', shell, cwd, initCommand, terminal, fitAddon, termContainer, element: paneEl, name: defaultName, ptyCreated: false, ptyKey: null, adoptPtyKey: null, isClaudePane: false, claudeSessionId: isClaude ? newClaudeSessionId() : null, claudeResume: false, predefinedCommands: predefinedCommands ? [...predefinedCommands] : [],
+                         sshProfileId: null, sshDot, sshDisconnected: false };
       panes.set(id, termData);
       globalPanes.set(id, termData);
       refreshCmdDropBtn();
@@ -3180,7 +4051,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
 
   // ── Fit + create PTYs for all terminals not yet initialised ───────────────
   async function initNewTerminals() {
-    const pending = [...panes.values()].filter(p => p.type === 'terminal' && !p.ptyCreated);
+    const pending = [...panes.values()].filter(p => isTermPane(p) && !p.ptyCreated);
     console.log('[initNewTerminals] pending count:', pending.length, pending.map(p => p.id));
     if (!pending.length) return;
 
@@ -3202,6 +4073,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       try {
         console.log('[initNewTerminals] opening terminal id:', pane.id);
         pane.terminal.open(pane.termContainer);
+        guardViewportSync(pane);
       } catch (e) {
         console.error('[initNewTerminals] terminal.open() threw for id', pane.id, e);
         continue;
@@ -3218,27 +4090,61 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
         pane.fitAddon.fit();
       }
       const { cols, rows } = pane.terminal;
-      console.log('[initNewTerminals] creating PTY id:', pane.id, 'cols:', cols, 'rows:', rows);
-      let ptyResult;
-      try {
-        ptyResult = await window.electronAPI.createPty(pane.id, cols, rows, pane.shell, pane.cwd, pane.name || null);
-      } catch (e) {
-        console.error('[initNewTerminals] createPty threw for id', pane.id, e);
-        pane.terminal.writeln(`\x1b[1;31mFailed to start terminal: ${e.message}\x1b[0m`);
-        continue;
+      let ptyKey = `${WIN_TAG}:${pane.id}`;
+      let ptyResult = null;
+
+      // A pane that arrived from another window (detach / re-attach) carries the key of a
+      // still-running PTY — take that over and replay its output instead of spawning a shell.
+      if (pane.adoptPtyKey) {
+        try {
+          ptyResult = await window.electronAPI.adoptPty(pane.adoptPtyKey, cols, rows);
+        } catch (e) {
+          console.error('[initNewTerminals] adoptPty threw for', pane.adoptPtyKey, e);
+        }
+        if (ptyResult?.success) {
+          ptyKey = pane.adoptPtyKey;
+          pane.bomStripped     = true;   // the BOM was consumed by the previous window
+          pane.initCommandSent = true;   // the session is already running — don't re-run it
+          if (ptyResult.buffer) pane.terminal.write(ptyResult.buffer);
+          if (ptyResult.sshState) setSshState(pane, ptyResult.sshState.state, ptyResult.sshState.message);
+        } else {
+          console.warn('[initNewTerminals] adopt failed for', pane.adoptPtyKey,
+                       '—', ptyResult?.error || 'unknown', '— starting a fresh shell');
+          ptyResult = null;
+        }
+        pane.adoptPtyKey = null;
       }
-      if (!ptyResult?.success) {
-        const msg = ptyResult?.error || 'unknown error';
-        console.error('[initNewTerminals] PTY creation failed for id', pane.id, msg);
-        pane.terminal.writeln(`\x1b[1;31mFailed to start terminal: ${msg}\x1b[0m`);
-        continue;
+
+      if (!ptyResult) {
+        console.log('[initNewTerminals] creating PTY key:', ptyKey, 'cols:', cols, 'rows:', rows);
+        try {
+          ptyResult = await window.electronAPI.createPty(ptyKey, cols, rows, pane.shell, pane.cwd, pane.name || null,
+                                                         pane.type === 'ssh' ? (pane.sshProfileId || 'none') : null);
+        } catch (e) {
+          console.error('[initNewTerminals] createPty threw for key', ptyKey, e);
+          pane.terminal.writeln(`\x1b[1;31mFailed to start terminal: ${e.message}\x1b[0m`);
+          continue;
+        }
+        if (!ptyResult?.success) {
+          const msg = ptyResult?.error || 'unknown error';
+          console.error('[initNewTerminals] PTY creation failed for key', ptyKey, msg);
+          pane.terminal.writeln(`\x1b[1;31mFailed to start terminal: ${msg}\x1b[0m`);
+          continue;
+        }
       }
-      console.log('[initNewTerminals] PTY created for id:', pane.id, ptyResult);
+      pane.ptyKey = ptyKey;
+      ptyPanes.set(ptyKey, pane);
+      console.log('[initNewTerminals] PTY ready for pane', pane.id, 'key:', ptyKey);
 
       // Track commands typed by the user
       let inputBuf = '';
       let inEsc = false;
       pane.terminal.onData(data => {
+        // A dropped SSH session waits for Enter to reconnect; other input is discarded.
+        if (pane.sshDisconnected) {
+          if (data.includes('\r')) reconnectSsh(pane);
+          return;
+        }
         for (const ch of data) {
           const code = ch.charCodeAt(0);
           if (inEsc) {
@@ -3260,10 +4166,10 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
           else if (ch === '\x7f' || ch === '\x08') { inputBuf = inputBuf.slice(0, -1); }  // Backspace
           else if (code >= 32) { inputBuf += ch; }
         }
-        window.electronAPI.writePty(pane.id, data);
+        window.electronAPI.writePty(pane.ptyKey, data);
       });
 
-      pane.terminal.onResize(({ cols, rows }) => window.electronAPI.resizePty(pane.id, cols, rows));
+      pane.terminal.onResize(({ cols, rows }) => window.electronAPI.resizePty(pane.ptyKey, cols, rows));
       // terminal.onFocus was removed in xterm v5; use focusin on the container instead
       pane.termContainer.addEventListener('focusin', () => { lastFocusedTerminalId = pane.id; });
       pane.ptyCreated = true;
@@ -3291,11 +4197,15 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     if (last?.terminal) last.terminal.focus();
   }
 
-  function destroyPane(id) {
+  // keepPty: the shell keeps running and is adopted by another window (detach).
+  function destroyPane(id, { keepPty = false } = {}) {
     const pane = panes.get(id);
     if (!pane) return;
-    if (pane.type === 'terminal') {
-      window.electronAPI.killPty(id);
+    if (isTermPane(pane)) {
+      if (pane.ptyKey) {
+        if (!keepPty) window.electronAPI.killPty(pane.ptyKey);
+        ptyPanes.delete(pane.ptyKey);
+      }
       pane.terminal.dispose();
     }
     if (pane.resizeObserver) pane.resizeObserver.disconnect();
@@ -3307,16 +4217,39 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
   // ── Helpers ───────────────────────────────────────────
   function updateAddButton() {
     document.getElementById('btn-add').disabled = panes.size >= MAX_PANES;
+    updateWelcomeScreen();
   }
 
   function refitAll() {
     for (const pane of panes.values())
-      if (pane.fitAddon && pane.ptyCreated) try { pane.fitAddon.fit(); } catch {}
+      if (pane.fitAddon && pane.ptyCreated) try { pane.fitAddon.fit(); syncViewport(pane); } catch {}
+  }
+
+  // ── xterm scrollbar fix ───────────────────────────────
+  // xterm's Viewport re-measures its element's offsetHeight on every buffer scroll
+  // and sizes the invisible scroll-area spacer from it. A pane sitting in an inactive
+  // tab is display:none, so that measurement is 0 and the spacer ends up about one
+  // screen too short — the scrollbar then bottoms out before the last line. Skip the
+  // sync while the pane is hidden, and force one when it becomes visible again.
+  function guardViewportSync(pane) {
+    const vp = pane.terminal?._core?.viewport;
+    if (!vp || vp._aideGuarded) return;
+    const original = vp.syncScrollArea.bind(vp);
+    vp.syncScrollArea = (immediate) => {
+      if (!pane.termContainer.clientHeight) return;
+      original(immediate);
+    };
+    vp._aideGuarded = true;
+  }
+
+  function syncViewport(pane) {
+    if (pane.termContainer?.clientHeight)
+      pane.terminal?._core?.viewport?.syncScrollArea(true);
   }
 
   // ── PTY events ────────────────────────────────────────
   window.electronAPI.onPtyData(({ id, data }) => {
-    const pane = globalPanes.get(id);
+    const pane = ptyPanes.get(id);
     if (!pane?.terminal) return;
     // Strip BOM injected by Windows ConPTY on first chunk
     if (!pane.bomStripped) {
@@ -3327,35 +4260,75 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     // Send init command once, after the shell emits its first output (prompt ready)
     if (pane.initCommand && !pane.initCommandSent) {
       pane.initCommandSent = true;
-      setTimeout(() => {
-        window.electronAPI.writePty(id, pane.initCommand + '\r');
-        // Poll JSONL files to detect Claude session ID for new sessions
-        if (!pane.claudeSessionId && /\bclaude(?:\.exe)?\b/i.test(pane.initCommand) && pane.cwd) {
-          const since = Date.now();
-          let attempts = 0;
-          const poll = async () => {
-            if (pane.claudeSessionId || attempts >= 8) return;
-            attempts++;
-            const sid = await window.electronAPI.getClaudeSessionId(pane.cwd, since);
-            if (sid) {
-              pane.claudeSessionId = sid;
-            } else {
-              setTimeout(poll, 2000);
-            }
-          };
-          setTimeout(poll, 2000);
+      setTimeout(async () => {
+        // Last line of defence: never --resume an id another pane owns or that Claude no
+        // longer has a transcript for — mint a new session instead.
+        if (pane.claudeResume && !(await canResumeClaude(pane))) {
+          pane.claudeSessionId = newClaudeSessionId();
+          pane.claudeResume    = false;
         }
+        const cmd = withClaudeSession(pane.initCommand, pane.claudeSessionId, pane.claudeResume)
+                 || pane.initCommand;
+        // Once launched, every later launch of this pane resumes the same session
+        if (isClaudeCommand(pane.initCommand)) pane.claudeResume = true;
+        window.electronAPI.writePty(id, cmd + '\r');
       }, 150);
     }
   });
   window.electronAPI.onPtyExit(({ id }) => {
-    const pane = globalPanes.get(id);
+    const pane = ptyPanes.get(id);
+    if (pane?.type === 'ssh') {
+      pane.sshDisconnected = true;
+      setSshState(pane, 'lost', 'Disconnected — click or press Enter to reconnect');
+      pane.terminal.writeln('\r\n\x1b[33m[Disconnected — press Enter to reconnect]\x1b[0m');
+      return;
+    }
     if (pane?.terminal) pane.terminal.writeln('\r\n\x1b[31m[Process exited]\x1b[0m');
     if (pane?.name && pane?.claudeSessionId && isClaudeCodePane(pane) && pane?.cwd) {
       window.electronAPI.generateSummary(pane.claudeSessionId, pane.cwd).then(summary => {
         if (summary) window.electronAPI.saveSummary(pane.name, summary);
       }).catch(() => {});
     }
+  });
+
+  // ── SSH panes ─────────────────────────────────────────
+  function setSshState(pane, state, message) {
+    pane.sshState = state;
+    if (!pane.sshDot) return;
+    pane.sshDot.className = `ssh-dot ${state}`;
+    pane.sshDot.title     = message || state;
+  }
+
+  // The session reuses the pane's pty key, so routing, detach and scrollback carry on.
+  async function reconnectSsh(pane) {
+    if (!pane.sshDisconnected || pane.sshReconnecting || !pane.ptyKey) return;
+    pane.sshReconnecting = true;
+    pane.sshDisconnected = false;
+    setSshState(pane, 'connecting', 'Connecting…');
+    pane.terminal.write('\r\n');
+    try {
+      const { cols, rows } = pane.terminal;
+      const r = await window.electronAPI.createPty(pane.ptyKey, cols, rows, null, null, pane.name || null,
+                                                   pane.sshProfileId || 'none');
+      if (!r?.success) {
+        pane.terminal.writeln(`\x1b[1;31mFailed to reconnect: ${r?.error || 'unknown error'}\x1b[0m`);
+        pane.sshDisconnected = true;
+        setSshState(pane, 'lost', 'Disconnected — click or press Enter to reconnect');
+      }
+    } finally {
+      pane.sshReconnecting = false;
+    }
+    pane.terminal.focus();
+  }
+
+  window.electronAPI.onSshStatus(({ id, state, message }) => {
+    const pane = ptyPanes.get(id);
+    if (pane) setSshState(pane, state, message);
+  });
+
+  window.electronAPI.onSshAsk((payload) => {
+    const pane = payload.ptyId ? ptyPanes.get(payload.ptyId) : null;
+    window.SshUI.handleAsk(payload, pane ? `Pane: ${pane.name}` : '');
   });
 
   let refitTimer = null;
@@ -3371,7 +4344,8 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     const only = tabs.size <= 1;
     for (const [id, tab] of tabs) {
       const el = document.createElement('div');
-      el.className = 'tab' + (id === activeTabId ? ' active' : '');
+      el.className = 'tab' + (id === activeTabId ? ' active' : '') + (tab.quick ? ' quick' : '');
+      if (tab.quick) el.title = 'Quick tab — not saved or restored';
 
       const nameSpan = document.createElement('span');
       nameSpan.className = 'tab-name';
@@ -3397,7 +4371,14 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       closeBtn.textContent = '✕';
       closeBtn.title = 'Close tab';
       closeBtn.style.visibility = only ? 'hidden' : '';
-      closeBtn.addEventListener('click', async (e) => { e.stopPropagation(); await closeTab(id); });
+      closeBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        // Closing a tab kills its terminals and SSH sessions — confirm unless it is empty
+        const n = tab.panes.size;
+        if (n && !(await showConfirmDialog(
+          `Close tab "${tab.name}"? Its ${n} panel${n !== 1 ? 's' : ''} will be closed.`, 'Close tab', 'Cancel'))) return;
+        await closeTab(id);
+      });
 
       el.draggable = true;
       el.addEventListener('dragstart', (e) => {
@@ -3466,7 +4447,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     grid  = tab.gridEl;
     updateAddButton();
     renderTabBar();
-    const hasPending = [...panes.values()].some(p => p.type === 'terminal' && !p.ptyCreated);
+    const hasPending = [...panes.values()].some(p => isTermPane(p) && !p.ptyCreated);
     if (hasPending) await initNewTerminals();
     else {
       // Wait one frame for the browser to re-layout the newly-visible grid
@@ -3482,8 +4463,8 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     if (!tab) return;
     for (const paneId of [...tab.panes.keys()]) {
       const pane = tab.panes.get(paneId);
-      if (pane.type === 'terminal') {
-        window.electronAPI.killPty(paneId);
+      if (isTermPane(pane)) {
+        if (pane.ptyKey) { window.electronAPI.killPty(pane.ptyKey); ptyPanes.delete(pane.ptyKey); }
         pane.terminal.dispose();
       }
       if (pane.resizeObserver) pane.resizeObserver.disconnect();
@@ -3504,12 +4485,15 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
   // ── Gather state of all tabs (for save-on-close) ─────
   async function gatherAllTabsState() {
     const tabsData = [];
-    for (const [, tab] of tabs) {
+    const savedIds = [];
+    for (const [id, tab] of tabs) {
+      if (tab.quick) continue;   // quick tabs are never saved
+      savedIds.push(id);
       const panesData = await Promise.all([...tab.panes.values()].map(async (pane) => {
         if (pane.type === 'explorer') {
           return { type: 'explorer', name: pane.name || null, gridArea: pane.element.style.gridArea || '', cwd: pane.cwd || null };
         } else if (pane.type === 'terminal') {
-          const info = pane.ptyCreated ? await window.electronAPI.getPaneInfo(pane.id) : { cwd: null, command: null };
+          const info = pane.ptyCreated ? await window.electronAPI.getPaneInfo(pane.ptyKey) : { cwd: null, command: null };
           return {
             type: 'terminal',
             name: pane.name || null,
@@ -3517,10 +4501,14 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
             shell: pane.shell,
             cwd: info.cwd || pane.cwd || null,
             initCommand: pane.initCommand || null,
-            claudeSessionId: pane.claudeSessionId || undefined,
+            isClaudePane: pane.isClaudePane || undefined,
+            claudeSessionId: savedClaudeSessionId(pane) || undefined,
             command: pane.lastCommand || info.command || null,
             predefinedCommands: pane.predefinedCommands?.length ? pane.predefinedCommands : undefined,
           };
+        } else if (pane.type === 'ssh') {
+          return { type: 'ssh', name: pane.name || null, gridArea: pane.element.style.gridArea || '', sshProfileId: pane.sshProfileId || null,
+                   predefinedCommands: pane.predefinedCommands?.length ? pane.predefinedCommands : undefined };
         } else if (pane.type === 'text') {
           return { type: 'text', name: pane.name || null, gridArea: pane.element.style.gridArea || '', filePath: pane.filePath || null };
         } else if (pane.type === 'memory') {
@@ -3543,7 +4531,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     return {
       savedAt: new Date().toISOString(),
       tabs: tabsData,
-      activeTabIndex: [...tabs.keys()].indexOf(activeTabId),
+      activeTabIndex: Math.max(0, savedIds.indexOf(activeTabId)),
     };
   }
 
@@ -3553,7 +4541,10 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     for (const [, tab] of tabs) {
       for (const paneId of [...tab.panes.keys()]) {
         const pane = tab.panes.get(paneId);
-        if (pane.type === 'terminal') { window.electronAPI.killPty(paneId); pane.terminal.dispose(); }
+        if (isTermPane(pane)) {
+          if (pane.ptyKey) { window.electronAPI.killPty(pane.ptyKey); ptyPanes.delete(pane.ptyKey); }
+          pane.terminal.dispose();
+        }
         pane.element.remove();
         globalPanes.delete(paneId);
       }
@@ -3616,7 +4607,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     setTimeout(() => {
       for (const tab of tabs.values())
         for (const pane of tab.panes.values())
-          if (pane.fitAddon && pane.ptyCreated) try { pane.fitAddon.fit(); } catch {}
+          if (pane.fitAddon && pane.ptyCreated) try { pane.fitAddon.fit(); syncViewport(pane); } catch {}
     }, 300);
   }
 
@@ -3677,18 +4668,23 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
     document.getElementById('toolbar').style.display = 'none';
     document.getElementById('tab-bar').style.display  = 'none';
     (async () => {
+      userDataPath = await window.electronAPI.getUserDataPath();
+      window.SshUI?.loadProfiles();   // warms the profile cache; SSH never blocks startup
       await createTab(detachedConfig.name || 'Detached');
       const cwd = detachedConfig.type === 'text'
         ? (detachedConfig.filePath || null)
         : (detachedConfig.cwd || null);
-      createPane(
+      const paneId = createPane(
         detachedConfig.type, null,
         detachedConfig.shell || null,
         cwd,
         detachedConfig.initCommand || null,
         detachedConfig.name || null,
-        detachedConfig.type === 'browser' ? (detachedConfig.url || null) : null
+        detachedConfig.type === 'browser' ? (detachedConfig.url || null) : null,
+        detachedConfig.predefinedCommands || null
       );
+      if (detachedConfig.type === 'ssh') setSshProfile(paneId, detachedConfig.sshProfileId);
+      adoptDetachedPty(paneId, detachedConfig);
       updateDefaultLayout();
       await initNewTerminals();
     })();
@@ -3707,11 +4703,12 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       const btn = document.getElementById('btn-save-state');
       const state = await gatherAllTabsState();
       const result = await window.electronAPI.saveLastState(state);
-      if (result.success) {
-        btn.textContent = '✓';
-        btn.style.background = '#388a34';
-        setTimeout(() => { btn.textContent = '💾'; btn.style.background = ''; }, 1500);
-      }
+      const ok = result?.success;
+      const icon = btn.innerHTML;
+      btn.textContent = ok ? '✓' : '✗';
+      btn.style.background = ok ? '#388a34' : '#a1260d';
+      if (!ok) console.error('[laststate] save refused:', result?.error);
+      setTimeout(() => { btn.innerHTML = icon; btn.style.background = ''; }, 1500);
     });
 
     document.getElementById('btn-recall-state').addEventListener('click', async () => {
@@ -3721,10 +4718,15 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       if (resume) await restoreAllTabs(lastState);
     });
 
+    document.getElementById('btn-prompt-archive').addEventListener('click', showPromptArchiveDialog);
+    document.getElementById('btn-quick-tab').addEventListener('click', showQuickTabDialog);
+
     setupDropdowns();
 
     (async () => {
       userDataPath = await window.electronAPI.getUserDataPath();
+      window.SshUI?.loadProfiles();   // warms the profile cache; SSH never blocks startup
+      layoutCategories = await loadAllLayouts();
       await createTab('Tab 1');
 
       // Check for saved last state
@@ -3734,33 +4736,21 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
         if (resume) await restoreAllTabs(lastState);
       }
 
-      let categorized;
-      try {
-        const text = await window.electronAPI.loadLayouts();
-        if (text) {
-          const parsed = parseConfigFile(text);
-          if (parsed.length > 0) categorized = categorize(parsed);
-        }
-      } catch (e) {
-        console.warn('Failed to load layouts config:', e);
-      }
-
-      if (!categorized) {
-        // Fall back to built-in ASCII definitions
-        const parsed = BUILTIN_ASCII.map(({ name, art }) =>
-          parseAsciiLayout(name, art.split('\n'))
-        );
-        categorized = categorize(parsed);
-      }
-
-      buildViewMenu(document.getElementById('view-menu'), categorized);
+      buildViewMenu(document.getElementById('view-menu'), layoutCategories);
       buildShellSubmenu(await window.electronAPI.listShells());
       updateAddButton();
 
       // Re-attach a detached pane when its window is closed
       window.electronAPI.onPaneReattach(async (config) => {
-        const { _snapshot, gridArea, ...rest } = config;
-        if (_snapshot) {
+        const { _snapshot, _sourceTabId, gridArea, ...rest } = config;
+        // Go back to the tab the pane was detached from; if it was closed, use the active tab
+        const hasSourceTab = tabs.has(_sourceTabId);
+        if (hasSourceTab && _sourceTabId !== activeTabId) await switchTab(_sourceTabId);
+        // The snapshot is only valid if the tab still holds exactly the panes it had at detach time
+        const snapshotValid = hasSourceTab && _snapshot &&
+          _snapshot.paneAreas.length === panes.size &&
+          _snapshot.paneAreas.every(({ id: pid }) => panes.has(pid));
+        if (snapshotValid) {
           // Restore the grid template that was active when the pane was detached
           if (_snapshot.gridClass) {
             grid.className = 'tab-grid ' + _snapshot.gridClass;
@@ -3780,7 +4770,11 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
           }
         }
         const cwd = rest.type === 'text' ? (rest.filePath || null) : (rest.cwd || null);
-        createPane(rest.type, gridArea, rest.shell || null, cwd, rest.initCommand || null, rest.name || null, rest.type === 'browser' ? (rest.url || null) : null);
+        const paneId = createPane(rest.type, snapshotValid ? gridArea : null, rest.shell || null, cwd, rest.initCommand || null, rest.name || null,
+                                  rest.type === 'browser' ? (rest.url || null) : null, rest.predefinedCommands || null);
+        if (rest.type === 'ssh') setSshProfile(paneId, rest.sshProfileId);
+        if (!snapshotValid) updateDefaultLayout();
+        adoptDetachedPty(paneId, rest);
         grid._updateResizeHandles?.();
         updateAddButton();
         await initNewTerminals();
@@ -3904,7 +4898,7 @@ Keep the task board updated as work progresses. Create tasks for non-trivial wor
       if (text && lastFocusedTerminalId) {
         const pane = globalPanes.get(lastFocusedTerminalId);
         if (pane?.ptyCreated) {
-          window.electronAPI.writePty(lastFocusedTerminalId, text);
+          window.electronAPI.writePty(pane.ptyKey, text);
           pane.terminal.focus();
         }
       }

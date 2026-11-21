@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, nativeTheme, shell, dialog, Menu, Tray, nativeImage, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, nativeTheme, shell, dialog, Menu, Tray, nativeImage, clipboard, webContents } = require('electron');
 app.setAppUserModelId('com.aide.app');
 Menu.setApplicationMenu(null);
 nativeTheme.themeSource = 'dark';
@@ -12,7 +12,38 @@ let tray = null;
 let isShuttingDown = false;
 const ptyProcesses = new Map();
 const ptyToSender  = new Map(); // maps pty id → webContents.id (for routing data to correct window)
+const ptyBuffers   = new Map(); // maps pty id → recent output, replayed when another window adopts it
+const sshStates    = new Map(); // maps pty id → last SSH connection state, handed over on adopt
+const MAX_PTY_BUFFER = 200000;  // chars of scrollback kept per pty
+
+// Output goes to whichever window currently owns the pty — ownership moves on detach/re-attach.
+function ptySend(id, channel, payload) {
+  const wcId = ptyToSender.get(id);
+  if (wcId == null) return false;
+  const wc = webContents.fromId(wcId);
+  if (!wc || wc.isDestroyed()) return false;
+  wc.send(channel, payload);
+  return true;
+}
 const stt = require('./stt/stt');
+// Loaded defensively (like node-pty): a broken ssh2 install only disables SSH panes.
+let ssh = null;
+let sshLoadError = null;
+try { ssh = require('./ssh/ssh'); }
+catch (e) { sshLoadError = e.message; console.error('[ssh] failed to load:', e); }
+
+// ── SSH prompts (host key, password, 2FA) ──────────────
+// The main process asks the window that owns the session, then waits for its answer.
+const sshAsks = new Map();   // request id → resolve
+let sshAskSeq = 0;
+
+function sshAsk(send, payload) {
+  return new Promise(resolve => {
+    const reqId = ++sshAskSeq;
+    sshAsks.set(reqId, resolve);
+    if (!send('ssh:ask', { reqId, ...payload })) { sshAsks.delete(reqId); resolve(null); }
+  });
+}
 
 // ── Session / last-state helpers ───────────────────────
 function sessionsFilePath()  { return path.join(app.getPath('userData'), 'sessions.json'); }
@@ -22,6 +53,63 @@ function loadSessionsFile() {
   return [];
 }
 function saveSessionsFile(sessions) { fs.writeFileSync(sessionsFilePath(), JSON.stringify(sessions, null, 2)); }
+
+// ── Last-state backups ─────────────────────────────────
+// laststate.json is the only record of the whole workspace, so every write
+// first rotates the previous file into laststate-backups/ and a write that
+// would wipe it (no tabs / unserialisable) is refused outright.
+const LAST_STATE_BACKUPS = 20;
+function lastStateBackupDir() { return path.join(app.getPath('userData'), 'laststate-backups'); }
+
+function stampFor(file, parsed) {
+  let d;
+  try { d = parsed?.savedAt ? new Date(parsed.savedAt) : fs.statSync(file).mtime; } catch { d = new Date(); }
+  if (isNaN(d.getTime())) d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function backupLastState(nextJson) {
+  const src = lastStatePath();
+  let current;
+  try { if (!fs.existsSync(src)) return; current = fs.readFileSync(src, 'utf8'); } catch { return; }
+  if (!current.trim() || current === nextJson) return;   // nothing worth keeping / no change
+  let parsed = null;
+  try { parsed = JSON.parse(current); } catch {}
+  try {
+    const dir = lastStateBackupDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const tabs = parsed?.tabs?.length ?? 0;
+    let dest = path.join(dir, `laststate-${stampFor(src, parsed)}-${tabs}tabs.json`);
+    let n = 1;
+    while (fs.existsSync(dest)) dest = dest.replace(/(-\d+)?\.json$/, `-${n++}.json`);
+    fs.writeFileSync(dest, current, 'utf8');
+    const kept = fs.readdirSync(dir).filter(f => /^laststate-.*\.json$/.test(f)).sort();
+    for (const f of kept.slice(0, Math.max(0, kept.length - LAST_STATE_BACKUPS)))
+      try { fs.unlinkSync(path.join(dir, f)); } catch {}
+  } catch (e) {
+    console.error('[laststate] backup failed:', e.message);
+  }
+}
+
+function writeLastState(lastState) {
+  if (!lastState || !Array.isArray(lastState.tabs) || lastState.tabs.length === 0)
+    return { success: false, error: 'refusing to overwrite laststate.json with an empty state' };
+  let json;
+  try { json = JSON.stringify(lastState, null, 2); } catch (e) { return { success: false, error: e.message }; }
+  if (!json || json.length < 2) return { success: false, error: 'state did not serialise' };
+  backupLastState(json);
+  const p   = lastStatePath();
+  const tmp = p + '.tmp';
+  try {
+    fs.writeFileSync(tmp, json, 'utf8');
+    fs.renameSync(tmp, p);              // never leaves a half-written or truncated file
+    return { success: true, path: p };
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    return { success: false, error: e.message };
+  }
+}
 
 function getPtyInfo(pid) {
   const result = { cwd: null, command: null };
@@ -119,6 +207,10 @@ function deployMcpScripts() {
     for (const file of fs.readdirSync(srcDir)) {
       fs.copyFileSync(path.join(srcDir, file), path.join(destDir, file));
     }
+    // Settings passed to every Claude pane via --settings: archives each prompt
+    const hookCmd = `node "${path.join(destDir, 'prompt-archive-hook.js')}"`;
+    const settings = { hooks: { UserPromptSubmit: [{ matcher: '', hooks: [{ type: 'command', command: hookCmd }] }] } };
+    fs.writeFileSync(path.join(destDir, 'aide-claude-settings.json'), JSON.stringify(settings, null, 2), 'utf8');
   } catch (e) {
     console.error('[mcp] deploy failed:', e.message);
   }
@@ -139,6 +231,11 @@ app.whenReady().then(() => {
   ipcMain.handle('shells:list', () => getAvailableShells());
 
   ipcMain.handle('app:getUserDataPath', () => app.getPath('userData'));
+  ipcMain.handle('app:getTempPath', () => {
+    const dir = path.join(app.getPath('temp'), 'aide-quick');
+    try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+    return dir;
+  });
 
   ipcMain.on('clipboard:read',  (e)      => { e.returnValue = clipboard.readText(); });
   ipcMain.on('clipboard:write', (e, txt) => { clipboard.writeText(txt); e.returnValue = null; });
@@ -246,6 +343,14 @@ app.whenReady().then(() => {
     } catch (e) { return { success: false, error: e.message }; }
   });
 
+  ipcMain.handle('prompt-archive:read', () => {
+    const filePath = path.join(os.homedir(), 'claude_prompts_archive.log');
+    try {
+      const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+      return { success: true, content, filePath };
+    } catch (e) { return { success: false, error: e.message, filePath }; }
+  });
+
   ipcMain.handle('fs:writeTextFile', (event, { filePath, content }) => {
     try {
       fs.writeFileSync(filePath, content, 'utf8');
@@ -289,53 +394,109 @@ app.whenReady().then(() => {
     return result.canceled ? null : result.filePaths[0];
   });
 
-  ipcMain.handle('pty:create', (event, { id, cols, rows, shell: shellPath, cwd, panelName }) => {
-    if (!pty) return { success: false, error: `node-pty failed to load: ${ptyLoadError}` };
-    const shell = shellPath || getShell();
-    const args = (shell.includes('pwsh') || shell.includes('powershell')) ? ['-NoLogo'] : [];
-    const startCwd = (cwd && fs.existsSync(cwd)) ? cwd : os.homedir();
+  // `sshProfile` set → an ssh2 session stands in for the local shell (same pty interface).
+  ipcMain.handle('pty:create', (event, { id, cols, rows, shell: shellPath, cwd, panelName, sshProfile }) => {
     let ptyProcess;
-    try {
-      const env = { ...process.env };
-      if (panelName) env.AIDE_PANEL_NAME = panelName;
-      ptyProcess = pty.spawn(shell, args, {
-        name: 'xterm-256color',
-        cols: cols || 80,
-        rows: rows || 24,
-        cwd: startCwd,
-        env,
+    if (sshProfile) {
+      if (!ssh) return { success: false, error: `SSH support failed to load: ${sshLoadError}` };
+      // Never orphan a live session under the same key (reconnect only follows an exit)
+      const stale = ptyProcesses.get(id);
+      if (stale) { ptyProcesses.delete(id); try { stale.kill(); } catch {} }
+      ptyToSender.set(id, event.sender.id);
+      ptyProcess = ssh.openSession(sshProfile, {
+        cols, rows, panelName,
+        ask:    (payload) => sshAsk((ch, p) => ptySend(id, ch, p), { ptyId: id, ...payload }),
+        status: (state, message) => {
+          sshStates.set(id, { state, message });
+          ptySend(id, 'ssh:status', { id, state, message });
+        },
       });
-    } catch (e) {
-      console.error('[pty:create] spawn failed:', e);
-      return { success: false, error: e.message };
+    } else {
+      if (!pty) return { success: false, error: `node-pty failed to load: ${ptyLoadError}` };
+      const shell = shellPath || getShell();
+      const args = (shell.includes('pwsh') || shell.includes('powershell')) ? ['-NoLogo'] : [];
+      const startCwd = (cwd && fs.existsSync(cwd)) ? cwd : os.homedir();
+      try {
+        const env = { ...process.env };
+        if (panelName) env.AIDE_PANEL_NAME = panelName;
+        ptyProcess = pty.spawn(shell, args, {
+          name: 'xterm-256color',
+          cols: cols || 80,
+          rows: rows || 24,
+          cwd: startCwd,
+          env,
+        });
+      } catch (e) {
+        console.error('[pty:create] spawn failed:', e);
+        return { success: false, error: e.message };
+      }
     }
 
-    const sender = event.sender;
     ptyProcesses.set(id, ptyProcess);
-    ptyToSender.set(id, sender.id);
+    ptyToSender.set(id, event.sender.id);
+    ptyBuffers.set(id, '');
 
     ptyProcess.onData((data) => {
-      if (!sender.isDestroyed()) {
-        sender.send('pty:data', { id, data });
+      let buf = (ptyBuffers.get(id) || '') + data;
+      if (buf.length > MAX_PTY_BUFFER) {
+        buf = buf.slice(buf.length - MAX_PTY_BUFFER);
+        // Drop the partial first line so the replay doesn't start mid-escape-sequence
+        const nl = buf.indexOf('\n');
+        if (nl > -1 && nl < 4096) buf = buf.slice(nl + 1);
       }
+      ptyBuffers.set(id, buf);
+      ptySend(id, 'pty:data', { id, data });
     });
 
     ptyProcess.onExit(({ exitCode }) => {
+      if (ptyProcesses.get(id) !== ptyProcess) return;   // replaced or killed — its successor owns the key
+      ptySend(id, 'pty:exit', { id, exitCode });
       ptyProcesses.delete(id);
       ptyToSender.delete(id);
-      if (!sender.isDestroyed()) {
-        sender.send('pty:exit', { id, exitCode });
-      }
+      ptyBuffers.delete(id);
+      sshStates.delete(id);
     });
 
     return { success: true };
   });
 
+  // Hand a running PTY to another window (detach / re-attach) instead of respawning it.
+  // Returns the buffered output so the adopting terminal can restore the scrollback.
+  ipcMain.handle('pty:adopt', (event, { id, cols, rows }) => {
+    const ptyProcess = ptyProcesses.get(id);
+    if (!ptyProcess) return { success: false, error: 'pty no longer running' };
+    ptyToSender.set(id, event.sender.id);
+    if (cols && rows) { try { ptyProcess.resize(cols, rows); } catch {} }
+    return { success: true, buffer: ptyBuffers.get(id) || '', sshState: sshStates.get(id) || null };
+  });
+
+  // Large single writes can overflow the ConPTY input pipe and get silently dropped
+  // (e.g. pasting a big block). Queue oversized payloads and drain them in chunks.
+  const PTY_CHUNK = 2048;
+  const ptyWriteQueue = new Map(); // id → { chunks: string[], draining: boolean }
+
+  function drainPtyQueue(id) {
+    const q = ptyWriteQueue.get(id);
+    if (!q) return;
+    const ptyProcess = ptyProcesses.get(id);
+    if (!ptyProcess) { ptyWriteQueue.delete(id); return; }
+    const chunk = q.chunks.shift();
+    if (chunk === undefined) { ptyWriteQueue.delete(id); return; }
+    try { ptyProcess.write(chunk); } catch { ptyWriteQueue.delete(id); return; }
+    setTimeout(() => drainPtyQueue(id), 5);
+  }
+
   ipcMain.on('pty:write', (event, { id, data }) => {
     const ptyProcess = ptyProcesses.get(id);
-    if (ptyProcess) {
-      ptyProcess.write(data);
-    }
+    if (!ptyProcess) return;
+    const q = ptyWriteQueue.get(id);
+    if (!q && data.length <= PTY_CHUNK) { ptyProcess.write(data); return; }
+    // Once queued, everything for this pty goes through the queue to preserve ordering.
+    const chunks = [];
+    for (let i = 0; i < data.length; i += PTY_CHUNK) chunks.push(data.slice(i, i + PTY_CHUNK));
+    if (q) { q.chunks.push(...chunks); return; }
+    ptyWriteQueue.set(id, { chunks });
+    drainPtyQueue(id);
   });
 
   ipcMain.on('pty:resize', (event, { id, cols, rows }) => {
@@ -351,6 +512,43 @@ app.whenReady().then(() => {
       ptyProcess.kill();
       ptyProcesses.delete(id);
     }
+    ptyToSender.delete(id);
+    ptyBuffers.delete(id);
+    ptyWriteQueue.delete(id);
+  });
+
+  // ── SSH profiles ──────────────────────────────────────
+  if (ssh) ssh.init(app.getPath('userData'));
+  const sshUnavailable = () => ({ success: false, error: `SSH support failed to load: ${sshLoadError}` });
+
+  ipcMain.handle('ssh:listProfiles', () => ssh ? ssh.listProfiles() : []);
+
+  ipcMain.handle('ssh:saveProfile', (event, draft) => {
+    if (!ssh) return sshUnavailable();
+    try { return { success: true, profile: ssh.saveProfile(draft) }; }
+    catch (e) { return { success: false, error: e.message }; }
+  });
+
+  ipcMain.handle('ssh:deleteProfile', (event, { id }) => {
+    if (!ssh) return sshUnavailable();
+    try { ssh.deleteProfile(id); return { success: true }; }
+    catch (e) { return { success: false, error: e.message }; }
+  });
+
+  ipcMain.handle('ssh:testProfile', (event, { id }) => {
+    if (!ssh) return sshUnavailable();
+    const sender = event.sender;
+    const send = (ch, p) => { if (sender.isDestroyed()) return false; sender.send(ch, p); return true; };
+    return ssh.testProfile(id, (payload) => sshAsk(send, payload));
+  });
+
+  ipcMain.handle('ssh:tailscaleStatus', () => ssh ? ssh.tailscaleStatus() : { installed: false, running: false, state: 'Unavailable', peers: [] });
+
+  ipcMain.on('ssh:answer', (event, { reqId, answer }) => {
+    const resolve = sshAsks.get(reqId);
+    if (!resolve) return;
+    sshAsks.delete(reqId);
+    resolve(answer ?? null);
   });
 
   // Layout config IPC
@@ -371,6 +569,55 @@ app.whenReady().then(() => {
     shell.openPath(userPath);
   });
 
+  // ── Designer layouts (layouts.json) ─────────────────────────────
+  // Richer than layouts.conf: keeps track sizes and per-panel settings.
+  const customLayoutsPath = () => path.join(app.getPath('userData'), 'layouts.json');
+
+  function readCustomLayouts() {
+    try {
+      const p = customLayoutsPath();
+      if (!fs.existsSync(p)) return [];
+      const data = JSON.parse(fs.readFileSync(p, 'utf8'));
+      return Array.isArray(data) ? data : (Array.isArray(data.layouts) ? data.layouts : []);
+    } catch (e) {
+      console.error('[layouts] failed to read layouts.json:', e.message);
+      return [];
+    }
+  }
+
+  function writeCustomLayouts(list) {
+    const p    = customLayoutsPath();
+    const tmp  = p + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(list, null, 2));
+    fs.renameSync(tmp, p);   // atomic-ish: never leaves a half-written file
+  }
+
+  ipcMain.handle('layouts:loadCustom', () => readCustomLayouts());
+
+  ipcMain.handle('layouts:saveCustom', (event, entry) => {
+    try {
+      if (!entry || !entry.name) return { success: false, error: 'Layout needs a name' };
+      const list = readCustomLayouts();
+      const record = { ...entry, id: entry.id || `L${Date.now()}`, savedAt: new Date().toISOString() };
+      const idx = list.findIndex(l => l.id === record.id || l.name === record.name);
+      if (idx >= 0) list[idx] = record; else list.push(record);
+      writeCustomLayouts(list);
+      return { success: true, layout: record, layouts: list };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  });
+
+  ipcMain.handle('layouts:deleteCustom', (event, { id }) => {
+    try {
+      const list = readCustomLayouts().filter(l => l.id !== id);
+      writeCustomLayouts(list);
+      return { success: true, layouts: list };
+    } catch (e) {
+      return { success: false, error: e.message };
+    }
+  });
+
   // Last-state IPC
   ipcMain.handle('app:load-last-state', () => {
     try {
@@ -380,14 +627,12 @@ app.whenReady().then(() => {
     return null;
   });
 
-  ipcMain.handle('app:save-last-state', (event, lastState) => {
-    try { fs.writeFileSync(lastStatePath(), JSON.stringify(lastState, null, 2)); return { success: true, path: lastStatePath() }; }
-    catch (e) { return { success: false, error: e.message }; }
-  });
+  ipcMain.handle('app:save-last-state', (event, lastState) => writeLastState(lastState));
 
   ipcMain.handle('app:confirm-close', (event, { lastState }) => {
     if (lastState) {
-      try { fs.writeFileSync(lastStatePath(), JSON.stringify(lastState, null, 2)); } catch {}
+      const res = writeLastState(lastState);
+      if (!res.success) console.error('[laststate] not saved on close:', res.error);
     }
     for (const [, ptyProcess] of ptyProcesses) { try { ptyProcess.kill(); } catch {} }
     ptyProcesses.clear();
@@ -429,6 +674,16 @@ app.whenReady().then(() => {
     const sessions = loadSessionsFile().filter(s => s.id !== id);
     saveSessionsFile(sessions);
     return { success: true };
+  });
+
+  // `claude --resume <id>` aborts when the transcript is gone (history cleared, project
+  // folder moved). Panes check this before resuming and fall back to a fresh session.
+  ipcMain.handle('claude:sessionExists', (event, { sessionId, cwd }) => {
+    try {
+      if (!sessionId || !cwd) return false;
+      const encoded = cwd.replace(/[:\\\/]/g, '-');
+      return fs.existsSync(path.join(os.homedir(), '.claude', 'projects', encoded, sessionId + '.jsonl'));
+    } catch { return false; }
   });
 
   ipcMain.handle('claude:getSessionId', (event, { cwd, since }) => {
@@ -540,12 +795,14 @@ app.whenReady().then(() => {
 
     const winContentId = detachWin.webContents.id;
     detachWin.on('closed', () => {
-      // Kill PTYs that belonged to this window
+      // Kill PTYs that belonged to this window — except the detached pane's own PTY,
+      // which the main window adopts again when it re-attaches the pane below.
       for (const [id, senderId] of [...ptyToSender]) {
-        if (senderId === winContentId) {
+        if (senderId === winContentId && id !== config.ptyKey) {
           const proc = ptyProcesses.get(id);
           if (proc) { try { proc.kill(); } catch {} ptyProcesses.delete(id); }
           ptyToSender.delete(id);
+          ptyBuffers.delete(id);
         }
       }
       // Reattach the pane back into the main window

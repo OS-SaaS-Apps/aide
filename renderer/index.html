@@ -23,6 +23,12 @@
       <button id="btn-restart" class="toolbar-btn toolbar-icon-btn" title="Restart app">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
       </button>
+      <button id="btn-quick-tab" class="toolbar-btn toolbar-icon-btn" title="Quick tab">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+      </button>
+      <button id="btn-prompt-archive" class="toolbar-btn toolbar-icon-btn" title="Prompt archive">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </button>
       <div class="toolbar-sep"></div>
       <button id="btn-stt" class="toolbar-btn toolbar-icon-btn" title="STT loading..." disabled>
         <svg id="stt-icon-mic" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
@@ -114,6 +120,10 @@
             </button>
             <div id="shell-submenu" class="submenu hidden"></div>
           </div>
+          <button class="dropdown-item" id="btn-add-ssh">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><polyline points="6 8 9 10 6 12"/><line x1="11" y1="12" x2="15" y2="12"/></svg>
+            SSH
+          </button>
           <button class="dropdown-item" id="btn-add-browser">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
             Browser
@@ -199,6 +209,36 @@ A space extends the pane to its left (or above).
     </div>
   </div>
 
+  <!-- Layout designer -->
+  <div id="designer-dialog" class="dialog-overlay hidden">
+    <div class="designer-box">
+      <div class="designer-header">
+        <div class="dialog-title">Layout Designer</div>
+        <div id="designer-subtitle" class="designer-subtitle"></div>
+        <button id="designer-maximize" class="designer-close-btn" title="Maximize (F11)"></button>
+        <button id="designer-close" class="designer-close-btn" title="Close (Esc)">✕</button>
+      </div>
+      <div class="designer-body">
+        <div id="designer-sidebar" class="designer-sidebar"></div>
+        <div class="designer-stage">
+          <div id="designer-canvas-wrap" class="designer-canvas-wrap">
+            <div id="designer-canvas" class="designer-canvas"></div>
+          </div>
+          <div id="designer-status" class="designer-status"></div>
+        </div>
+      </div>
+      <div class="designer-footer">
+        <button id="designer-save-template" class="toolbar-btn dialog-cancel-btn">Save as template…</button>
+        <button id="designer-export-ascii" class="toolbar-btn dialog-cancel-btn">Copy as ASCII</button>
+        <button id="designer-open-conf" class="toolbar-btn dialog-cancel-btn">Open layouts.conf</button>
+        <div class="designer-footer-spacer"></div>
+        <button id="designer-cancel" class="toolbar-btn dialog-cancel-btn">Cancel</button>
+        <button id="designer-apply-newtab" class="toolbar-btn dialog-cancel-btn">Apply to new tab</button>
+        <button id="designer-apply" class="toolbar-btn">Apply to this tab</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Close confirmation dialog -->
   <div id="close-dialog" class="dialog-overlay hidden">
     <div class="dialog-box">
@@ -228,8 +268,27 @@ A space extends the pane to its left (or above).
     </div>
   </div>
 
+  <!-- Prompt archive dialog -->
+  <div id="prompt-archive-dialog" class="dialog-overlay hidden">
+    <div class="dialog-box prompt-archive-box">
+      <div class="prompt-archive-header">
+        <div class="dialog-title">Prompt Archive</div>
+        <button id="prompt-archive-close" class="session-delete-btn" style="font-size:14px;padding:2px 6px">✕</button>
+      </div>
+      <input id="prompt-archive-search" class="url-bar" type="text" placeholder="Filter prompts…" spellcheck="false" />
+      <div id="prompt-archive-list" class="prompt-archive-list"></div>
+      <div class="dialog-actions">
+        <span id="prompt-archive-count" class="dialog-label dialog-hint" style="flex:1;text-transform:none;letter-spacing:0"></span>
+        <button id="prompt-archive-clear" class="toolbar-btn dialog-cancel-btn">Clear archive</button>
+      </div>
+    </div>
+  </div>
+
   <script src="xterm/xterm.js"></script>
   <script src="xterm/addon-fit.js"></script>
+  <script src="layout-model.js"></script>
+  <script src="designer.js"></script>
+  <script src="ssh-ui.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

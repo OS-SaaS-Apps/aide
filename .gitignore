@@ -10,7 +10,6 @@ test.bin
 memory/
 tasks/
 data/
-scripts/
 .mcp.json
 mcp/
 requirements/

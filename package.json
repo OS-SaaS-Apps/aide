@@ -1,16 +1,17 @@
 {
   "name": "aide",
-  "version": "1.0.0",
+  "version": "1.0.7",
   "description": "Minimal tiled terminal app built on Electron + xterm.js",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "postinstall": "node scripts/fix-winpty.js && electron-rebuild",
+    "postinstall": "node scripts/fix-winpty.js && electron-rebuild -o node-pty",
     "dist": "electron-builder --win && rmdir /s /q dist\\win-unpacked"
   },
   "dependencies": {
     "node-pty": "^1.0.0",
-    "sherpa-onnx": "^1.12.33"
+    "sherpa-onnx": "^1.12.33",
+    "ssh2": "^1.17.0"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.6.0",
@@ -23,7 +24,7 @@
     "appId": "com.aide.app",
     "productName": "AIDE",
     "icon": "images/favicon_dark.ico",
-    "npmRebuild": true,
+    "npmRebuild": false,
     "asarUnpack": [
       "node_modules/node-pty/**",
       "node_modules/sherpa-onnx/**",
@@ -54,6 +55,7 @@
       "main.js",
       "preload.js",
       "stt/**",
+      "ssh/**",
       "renderer/**",
       "node_modules/**",
       "!node_modules/node-pty/build/Release/obj",

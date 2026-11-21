@@ -1,8 +1,20 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('electronAPI', {
-  createPty: (id, cols, rows, shell, cwd, panelName) =>
-    ipcRenderer.invoke('pty:create', { id, cols, rows, shell, cwd, panelName }),
+  createPty: (id, cols, rows, shell, cwd, panelName, sshProfile) =>
+    ipcRenderer.invoke('pty:create', { id, cols, rows, shell, cwd, panelName, sshProfile }),
+
+  sshListProfiles:   ()      => ipcRenderer.invoke('ssh:listProfiles'),
+  sshSaveProfile:    (draft) => ipcRenderer.invoke('ssh:saveProfile', draft),
+  sshDeleteProfile:  (id)    => ipcRenderer.invoke('ssh:deleteProfile', { id }),
+  sshTestProfile:    (id)    => ipcRenderer.invoke('ssh:testProfile', { id }),
+  sshTailscaleStatus: ()     => ipcRenderer.invoke('ssh:tailscaleStatus'),
+  sshAnswer:         (reqId, answer) => ipcRenderer.send('ssh:answer', { reqId, answer }),
+  onSshAsk:    (callback) => ipcRenderer.on('ssh:ask',    (event, payload) => callback(payload)),
+  onSshStatus: (callback) => ipcRenderer.on('ssh:status', (event, payload) => callback(payload)),
+
+  adoptPty: (id, cols, rows) =>
+    ipcRenderer.invoke('pty:adopt', { id, cols, rows }),
 
   openDirectoryPicker: (title) =>
     ipcRenderer.invoke('dialog:openDirectory', { title }),
@@ -81,11 +93,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openConfigFile: () =>
     ipcRenderer.invoke('layouts:openFile'),
 
+  loadCustomLayouts: () =>
+    ipcRenderer.invoke('layouts:loadCustom'),
+
+  saveCustomLayout: (entry) =>
+    ipcRenderer.invoke('layouts:saveCustom', entry),
+
+  deleteCustomLayout: (id) =>
+    ipcRenderer.invoke('layouts:deleteCustom', { id }),
+
   getPaneInfo: (id) =>
     ipcRenderer.invoke('session:getPaneInfo', { id }),
 
   getClaudeSessionId: (cwd, since) =>
     ipcRenderer.invoke('claude:getSessionId', { cwd, since }),
+
+  claudeSessionExists: (sessionId, cwd) =>
+    ipcRenderer.invoke('claude:sessionExists', { sessionId, cwd }),
 
   generateSummary: (sessionId, cwd) =>
     ipcRenderer.invoke('claude:generateSummary', { sessionId, cwd }),
@@ -141,4 +165,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.on('stt:status-change', (event, state) => callback(state)),
 
   getUserDataPath: () => ipcRenderer.invoke('app:getUserDataPath'),
+  getTempPath: () => ipcRenderer.invoke('app:getTempPath'),
+
+  readPromptArchive: () => ipcRenderer.invoke('prompt-archive:read'),
 });
